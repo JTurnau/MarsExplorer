@@ -37,6 +37,8 @@ DEFAULT_CONFIG={
     # ======== MULTI-AGENT EXTENSION =======
     "n_agents":2,
     "shared_map":True,
+    "env_mode":"sim",
+    "slip_prob":0.5,
 
     # ======== VIEWER =========
     # "viewer":{"width":21*30,

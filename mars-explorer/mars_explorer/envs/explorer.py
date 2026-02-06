@@ -84,11 +84,22 @@ class ExplorerMA(gym.Env):
 
     def _choice(self, agent_idx, action):
         dx, dy = 0, 0
+
+        print(f"Agent {agent_idx} choice")
+
         if action == 0: dx = 1
         elif action == 1: dx = -1
         elif action == 2: dy = 1
         elif action == 3: dy = -1
+
+        # If the environment mode is set to 'real', apply uniform probability to slip
+        if self.conf["env_mode"] == "real":
+            if np.random.rand() < self.conf["slip_prob"]:
+                print(f"Agent {agent_idx} slipped")
+                dx, dy = 0, 0
+        
         self._move(agent_idx, dx, dy)
+            
 
     def _get_obs(self, agent_idx):
         obs = np.zeros((self.sizeX, self.sizeY, 3), dtype=np.float32)
