@@ -31,7 +31,8 @@ class Viewer():
 
         for x, y in env.obstacles_idx:
             Obstacle(self, x, y)
-        self.player = Drone(self, env)
+        
+        self.players = [Drone(self, env, agent_id=i) for i in range(env.n_agents)]
 
     def load_data(self):
         self.drone_img = pg.image.load(self.conf["drone_img"]).convert_alpha()
@@ -77,7 +78,7 @@ class Viewer():
 
     def render_fog_explored(self):
         # dark everywhere(unexplored), but light on every explored cell
-        explored_idx = np.where(self.env.outputMap > .0)
+        explored_idx = np.where(self.env.exploredMap > 0.0)
         explored_x = explored_idx[0]
         explored_y = explored_idx[1]
         explored_idx = np.stack((explored_x, explored_y), axis=1)
@@ -85,30 +86,36 @@ class Viewer():
 
         self.fog.fill(self.conf["night_color"])
 
-        for x,y in explored_idx:
-            cameraX = (x+.5)*self.TILESIZE
-            cameraY = (y+.5)*self.TILESIZE
-
+        # render explored cells
+        for x, y in explored_idx:
+            cameraX = (x + 0.5) * self.TILESIZE
+            cameraY = (y + 0.5) * self.TILESIZE
             self.light_rect.center = (cameraX, cameraY)
-
             self.fog.blit(self.light_mask, self.light_rect)
+
         self.screen.blit(self.fog, (0, 0), special_flags=pg.BLEND_MULT)
 
     def draw_lidar_rays(self):
-        thetas, ranges = self.env.ldr.thetas, self.env.ldr.ranges
-        currentX = self.env.x*self.TILESIZE+0.5*self.TILESIZE
-        currentY = self.env.y*self.TILESIZE+0.5*self.TILESIZE
-        xObs = (currentX + self.TILESIZE*ranges*np.cos(thetas)).astype(float)
-        yObs = (currentY + self.TILESIZE*ranges*np.sin(thetas)).astype(float)
-        for x,y in zip(xObs, yObs):
-            pg.draw.line(self.screen, self.RED, (currentX, currentY), (x, y))
-            pg.draw.circle(self.screen, self.RED, (x, y), self.TILESIZE/8)
+        for agent_id, ldr in enumerate(self.env.ldrs):
+            thetas, ranges = ldr.thetas, ldr.ranges
+            
+            # get this agent's current position
+            pos = self.env.positions[agent_id]
+            currentX = pos[0]*self.TILESIZE + 0.5*self.TILESIZE
+            currentY = pos[1]*self.TILESIZE + 0.5*self.TILESIZE
+            
+            xObs = (currentX + self.TILESIZE*ranges*np.cos(thetas)).astype(float)
+            yObs = (currentY + self.TILESIZE*ranges*np.sin(thetas)).astype(float)
+            
+            for x, y in zip(xObs, yObs):
+                pg.draw.line(self.screen, self.RED, (currentX, currentY), (x, y))
+                pg.draw.circle(self.screen, self.RED, (x, y), self.TILESIZE/8)
 
-    def draw_grid(self):
-        for x in range(0, self.conf["width"], self.TILESIZE):
-            pg.draw.line(self.screen, self.LIGHT_GREY, (x, 0), (x, self.conf["height"]))
-        for y in range(0, self.conf["height"], self.TILESIZE):
-            pg.draw.line(self.screen, self.LIGHT_GREY, (0, y), (self.conf["width"], y))
+        def draw_grid(self):
+            for x in range(0, self.conf["width"], self.TILESIZE):
+                pg.draw.line(self.screen, self.LIGHT_GREY, (x, 0), (x, self.conf["height"]))
+            for y in range(0, self.conf["height"], self.TILESIZE):
+                pg.draw.line(self.screen, self.LIGHT_GREY, (0, y), (self.conf["width"], y))
 
     def draw_traceline(self):
 

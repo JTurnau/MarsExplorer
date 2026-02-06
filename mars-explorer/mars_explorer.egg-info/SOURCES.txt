@@ -5,3 +5,4 @@ mars_explorer.egg-info/SOURCES.txt
 mars_explorer.egg-info/dependency_links.txt
 mars_explorer.egg-info/requires.txt
 mars_explorer.egg-info/top_level.txt
+tests/test.py

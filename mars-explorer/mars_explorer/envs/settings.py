@@ -1,3 +1,6 @@
+import os
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # points to mars-explorer/
+
 DEFAULT_CONFIG={
     # ======== TOPOLOGY =======
     #  general configuration for the topology of operational area
@@ -31,17 +34,34 @@ DEFAULT_CONFIG={
     "lidar_range":6,
     "lidar_channels":32,
 
+    # ======== MULTI-AGENT EXTENSION =======
+    "n_agents":2,
+    "shared_map":True,
+
     # ======== VIEWER =========
-    "viewer":{"width":21*30,
-              "height":21*30,
-              "title":"Mars-Explorer-V01",
-              "drone_img":'/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/drone.png',
-              "obstacle_img":'/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/block.png',
-              "background_img":'/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/mars.jpg',
-              "light_mask":"/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/light_350_hard.png",
-              "night_color":(20, 20, 20),
-              "draw_lidar":True,
-              "draw_grid":False,
-              "draw_traceline":False
-             }
+    # "viewer":{"width":21*30,
+    #           "height":21*30,
+    #           "title":"Mars-Explorer-V01",
+    #           "drone_img":'/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/drone.png',
+    #           "obstacle_img":'/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/block.png',
+    #           "background_img":'/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/mars.jpg',
+    #           "light_mask":"/home/dkoutras/GeneralExplorationPolicy/mars-explorer/tests/img/light_350_hard.png",
+    #           "night_color":(20, 20, 20),
+    #           "draw_lidar":True,
+    #           "draw_grid":False,
+    #           "draw_traceline":False
+    #          }
+    "viewer": {
+        "width": 21*30,
+        "height": 21*30,
+        "title": "Mars-Explorer-V01",
+        "drone_img": os.path.join(BASE_DIR, "img/drone.png"),
+        "obstacle_img": os.path.join(BASE_DIR, "img/block.png"),
+        "background_img": os.path.join(BASE_DIR, "img/mars.jpg"),
+        "light_mask": os.path.join(BASE_DIR, "img/light_350_hard.png"),
+        "night_color": (20, 20, 20),
+        "draw_lidar": True,
+        "draw_grid": False,
+        "draw_traceline": False
+    }
 }

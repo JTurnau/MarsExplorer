@@ -1,11 +1,11 @@
-Metadata-Version: 1.0
-Name: mars-explorer
+Metadata-Version: 2.2
+Name: mars_explorer
 Version: 0.0.1
 Summary: Exploration of unknonw areas using lidar
-Home-page: UNKNOWN
-Author: UNKNOWN
-Author-email: UNKNOWN
-License: UNKNOWN
-Description: UNKNOWN
 Keywords: exploration,robotics,environment,agent,rl,openaigym,openai-gym,gym
-Platform: UNKNOWN
+Requires-Dist: gym>=0.9.6
+Requires-Dist: numpy>=1.19.2
+Requires-Dist: pygame>=2.0.0
+Dynamic: keywords
+Dynamic: requires-dist
+Dynamic: summary

@@ -6,9 +6,12 @@ class Generator:
     # def __init__(self, size=[30, 30], obstacles=10, number_rows=None,
     #              number_columns=None, noise=[0, 0], margins=[0.15, 0.15],
     #              obstacle_size=[0.0, 0.0]):
-    def __init__(self, config):
+    def __init__(self, config, seed=None):
         # obstacles --> number of obstacles in the map
         # margins --> left,right,top,bottom margins as percentages that are free
+
+        if seed is not None:
+            np.random.seed(seed)  # set the seed for reproducibility
 
         self.width = config["size"][1]
         self.height = config["size"][0]

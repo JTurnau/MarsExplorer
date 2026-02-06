@@ -1,4 +1,5 @@
 import numpy as np
+import pygame as pg
 
 from mars_explorer.utils.randomMapGenerator import Generator
 from mars_explorer.utils.lidarSensor import Lidar
@@ -6,215 +7,212 @@ from mars_explorer.render.viewer import Viewer
 from mars_explorer.envs.settings import DEFAULT_CONFIG
 
 import gym
-from gym import error, spaces, utils
-from gym.utils import seeding
+from gym import spaces
 
-class Explorer(gym.Env):
+class ExplorerMA(gym.Env):
     metadata = {'render.modes': ['rgb_array'],
                 'video.frames_per_second': 6}
-    # def __init__(self, conf=None):
-    #  check why conf is not compatible will RLlib (it works on standalone gym)
-    def __init__(self):
 
-        # if conf==None:
-        #     self.conf = DEFAULT_CONFIG
-        # else:
-        #     self.conf = conf
-        self.conf = DEFAULT_CONFIG
+    def __init__(self, conf=None):
+        self.conf = DEFAULT_CONFIG if conf is None else conf
 
-        self.sizeX = self.conf["size"][0]
-        self.sizeY = self.conf["size"][1]
-
-        self.movementCost = self.conf["movementCost"]
-
+        self.sizeX, self.sizeY = self.conf["size"]
         self.SIZE = self.conf["size"]
+        self.movementCost = self.conf["movementCost"]
+        self.n_agents = self.conf.get("n_agents", 1)
+        self.shared_map = self.conf.get("shared_map", True)
 
-        self.action_space = gym.spaces.Discrete(4)
-        self.observation_space = gym.spaces.Box(0.,1.,(self.sizeX, self.sizeY, 1))
+        self.last_actions = [0, 0]
+
+        self.action_space = spaces.MultiDiscrete([4]*self.n_agents)
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(self.sizeX, self.sizeY, 2),
+            dtype=np.float32
+        )
+
 
         self.viewerActive = False
 
-    # def reset(self, initial=[0,0]):
-    def reset(self):
-
+    def reset(self, seed=None):
         self.maxSteps = self.conf["max_steps"]
 
-        # groundTruthMap --> 1.0 obstacle
-        #                    0.3 free to move
-        #                    0.0 unexplored
-        #                    0.6 robot
-        gen = Generator(self.conf)
+        # generate map with a fixed seed
+        gen = Generator(self.conf, seed=seed)
         randomMap = gen.get_map().astype(np.double)
         randomMapOriginal = randomMap.copy()
         randomMap[randomMap == 1.0] = 1.0
         randomMap[randomMap == 0.0] = 0.3
         self.groundTruthMap = randomMap
 
-        # for lidar --> 0 free cell
-        #               1 obstacle
-        self.ldr = Lidar(r=self.conf["lidar_range"],
-                         channels=self.conf["lidar_channels"],
-                         map=randomMapOriginal)
+        # lidar for each agent
+        self.ldrs = [Lidar(r=self.conf["lidar_range"],
+                          channels=self.conf["lidar_channels"],
+                          map=randomMapOriginal) for _ in range(self.n_agents)]
 
+        # obstacles
         obstacles_idx = np.where(self.groundTruthMap == 1.0)
-        obstacles_x = obstacles_idx[0]
-        obstacles_y = obstacles_idx[1]
-        self.obstacles_idx = np.stack((obstacles_x, obstacles_y), axis=1)
-        self.obstacles_idx = [list(i) for i in self.obstacles_idx]
+        self.obstacles_idx = [list(i) for i in np.stack((obstacles_idx[0], obstacles_idx[1]), axis=1)]
 
-        # 0 if not visible/visited, 1 if visible/visited
+        # shared explored map
         self.exploredMap = np.zeros(self.SIZE, dtype=np.double)
 
-        self.x, self.y = self.conf["initial"][0], self.conf["initial"][1]
+        # initialize agent positions
+        initial = self.conf.get("initial", [0,0])
+        self.positions = []
+        for i in range(self.n_agents):
+            x = initial[0] + i
+            y = initial[1]
+            self.positions.append([x, y])
 
-        self.state_trajectory = []
-        self.reward_trajectory = []
-        self.drone_trajectory = []
-
-        # initialing position is explored
-        self._activateLidar()
-        self._updateMaps()
-
-        self.outputMap = self.exploredMap.copy()
-        self.outputMap[self.x, self.y] = 0.6
-
-        self.new_state = np.reshape(self.outputMap, (self.sizeX, self.sizeY,1))
-        self.reward = 0
-        self.done = False
+        # trajectories and rewards
+        self.state_trajectory = [[] for _ in range(self.n_agents)]
+        self.reward_trajectory = [[] for _ in range(self.n_agents)]
+        self.drone_trajectory = [[] for _ in range(self.n_agents)]
 
         self.timeStep = 0
+        self.dones = [False]*self.n_agents
+        self.rewards = [0]*self.n_agents
 
-        self.viewerActive = False
-        self.out_of_bounds = False
-        self.collision = False
-        self.action = 0
+        # activate lidars and update map
+        for i in range(self.n_agents):
+            self._activateLidar(i)
+        self._updateMaps()
 
-        return self.new_state
+        return [self._get_obs(i) for i in range(self.n_agents)]
+
+    def _choice(self, agent_idx, action):
+        dx, dy = 0, 0
+        if action == 0: dx = 1
+        elif action == 1: dx = -1
+        elif action == 2: dy = 1
+        elif action == 3: dy = -1
+        self._move(agent_idx, dx, dy)
+
+    def _get_obs(self, agent_idx):
+        obs = np.zeros((self.sizeX, self.sizeY, 3), dtype=np.float32)
+
+        # Channel 0: shared explored map
+        obs[:, :, 0] = self.exploredMap
+
+        # Channel 1: this agent's position
+        x, y = self.positions[agent_idx]
+        obs[x, y, 1] = 1.0
+
+        # Channel 2: other agents' positions
+        for i, (ox, oy) in enumerate(self.positions):
+            if i != agent_idx:
+                obs[ox, oy, 2] = 1.0
+
+        return obs
 
 
-    def action_space_sample(self):
-        random = np.random.randint(4)
-        return random
+    def _move(self, agent_idx, dx, dy):
+        candX = self.positions[agent_idx][0] + dx
+        candY = self.positions[agent_idx][1] + dy
+
+        in_bounds = 0 <= candX < self.sizeX and 0 <= candY < self.sizeY
+        in_obstacle = [candX, candY] in self.obstacles_idx
+
+        if in_bounds and not in_obstacle:
+            self.positions[agent_idx] = [candX, candY]
+        else:
+            self.dones[agent_idx] = True
+            if not in_bounds:
+                self.rewards[agent_idx] = self.conf["out_of_bounds_reward"]
+            elif in_obstacle:
+                self.rewards[agent_idx] = self.conf["collision_reward"]
+
+    def _activateLidar(self, agent_idx):
+        self.ldrs[agent_idx].update(self.positions[agent_idx])
+        self.lidarIndexes = getattr(self, 'lidarIndexes', {})
+        self.lidarIndexes[agent_idx] = self.ldrs[agent_idx].idx
+
+    def _updateMaps(self):
+        # shared explored map
+        self.pastExploredMap = self.exploredMap.copy()
+        
+        # accumulate lidar readings from all agents
+        for idx in range(self.n_agents):
+            lidarX = self.lidarIndexes[idx][:,0]
+            lidarY = self.lidarIndexes[idx][:,1]
+            self.exploredMap[lidarX, lidarY] = self.groundTruthMap[lidarX, lidarY]
+
+        # mark agent positions as explored; removed in favor of channels
+        # for pos in self.positions:
+        #     self.exploredMap[pos[0], pos[1]] = 0.6
+
+    def _computeReward(self):
+        new_explored = int(np.count_nonzero(self.exploredMap))
+        old_explored = int(np.count_nonzero(self.pastExploredMap))
+        reward_increment = new_explored - old_explored
+        for i in range(self.n_agents):
+            if self.rewards[i] == 0:
+                self.rewards[i] = float(reward_increment - self.movementCost)
+
+    def step(self, actions):
+        if isinstance(actions, np.ndarray):
+            actions = actions.tolist()  # convert np array to list
+
+        self.rewards = [0]*self.n_agents
+
+        self.last_actions = actions
+
+        for i, action in enumerate(actions):
+            if not self.dones[i]:
+                self._choice(i, int(action))   # move agent
+                self._activateLidar(i)
+
+
+        self._updateMaps()
+        self._computeReward()
+        self.timeStep += 1
+
+        # ------------------- Check for agent-agent collisions -------------------
+        positions_seen = {}
+        for i, pos in enumerate(self.positions):
+            pos_tuple = tuple(pos)
+            if pos_tuple in positions_seen:
+                # collision: mark both agents as done
+                collided_agent = positions_seen[pos_tuple]
+                self.dones[i] = True
+                self.dones[collided_agent] = True
+                self.rewards[i] = self.conf.get("collision_reward", -400)
+                self.rewards[collided_agent] = self.conf.get("collision_reward", -400)
+            else:
+                positions_seen[pos_tuple] = i
+        # ------------------------------------------------------------------------
+
+        # check done due to max steps or full exploration
+        if self.timeStep >= self.maxSteps or np.count_nonzero(self.exploredMap) > 0.95*(self.SIZE[0]*self.SIZE[1]):
+            self.dones = [True]*self.n_agents
+
+        # update trajectories
+        for i in range(self.n_agents):
+            self.state_trajectory[i].append(np.reshape(self.exploredMap, (self.sizeX, self.sizeY,1)))
+            self.reward_trajectory[i].append(self.rewards[i])
+            self.drone_trajectory[i].append(self.positions[i].copy())
+
+        obs = [self._get_obs(i) for i in range(self.n_agents)]
+        
+        return obs, self.rewards, self.dones, {}
+
 
 
     def render(self, mode='human'):
-
-        if not self.viewerActive:
+        if not hasattr(self, "viewer") or self.viewer is None:
             self.viewer = Viewer(self, self.conf["viewer"])
             self.viewerActive = True
-
-        self.viewer.run()
-        # XXX: check why flip axes ... @dkoutras
-        return np.swapaxes(self.viewer.get_display_as_array(), 0, 1)
-
-
-    def _choice(self, choice):
-
-        if choice == 0:
-            self._move(x=1, y=0)
-        elif choice == 1:
-            self._move(x=-1, y=0)
-        elif choice == 2:
-            self._move(x=0, y=1)
-        elif choice == 3:
-            self._move(x=0, y=-1)
-
-
-    def _move(self, x, y):
-
-        canditateX = self.x + x
-        canditateY = self.y + y
-
-        in_x_axis = canditateX>=0 and canditateX<=(self.sizeX-1)
-        in_y_axis = canditateY>=0 and canditateY<=(self.sizeY-1)
-        in_obstacles = [canditateX, canditateY] in self.obstacles_idx
-
-        if in_x_axis and in_y_axis and not in_obstacles:
-            self.x += x
-            self.y += y
-        elif not in_x_axis or not in_y_axis:
-            # out of bounds move, episode terminated with punishment (negative
-            # reward)
-            self.out_of_bounds = True
-        elif in_obstacles:
-            # collision with obstacle, punishment (negative reward)
-            self.collision = True
-
-
-    def _updateMaps(self):
-
-        self.pastExploredMap = self.exploredMap.copy()
-
-        lidarX = self.lidarIndexes[:,0]
-        lidarY = self.lidarIndexes[:,1]
-        self.exploredMap[lidarX, lidarY] = self.groundTruthMap[lidarX, lidarY]
-
-        self.exploredMap[self.x, self.y] = 0.6
-
-
-    def _activateLidar(self):
-
-        self.ldr.update([self.x, self.y])
-        thetas, ranges = self.ldr.thetas, self.ldr.ranges
-        indexes = self.ldr.idx
-
-        self.lidarIndexes = indexes
-
-
-    def _applyRLactions(self,action):
-
-        self._choice(action)
-        self._activateLidar()
-        self._updateMaps()
-
-        self.outputMap = self.exploredMap.copy()
-        self.outputMap[self.x, self.y] = 0.5
-        self.new_state = np.reshape(self.outputMap, (self.sizeX, self.sizeY,1))
-        self.timeStep += 1
-
-
-    def _computeReward(self):
-
-        pastExploredCells = np.count_nonzero(self.pastExploredMap)
-        currentExploredCells = np.count_nonzero(self.exploredMap)
-
-        # TODO: add fixed cost for moving (-0.5 per move)
-        self.reward = currentExploredCells - pastExploredCells - self.movementCost
-
-
-    def _checkDone(self):
-
-        if self.timeStep > self.maxSteps:
-            self.done = True
-        elif np.count_nonzero(self.exploredMap) > 0.95*(self.SIZE[0]*self.SIZE[1]):
-            self.done = True
-            self.reward = self.conf["bonus_reward"]
-        elif self.collision:
-            self.done = True
-            self.reward = self.conf["collision_reward"]
-        elif self.out_of_bounds:
-            self.done = True
-            self.reward = self.conf["out_of_bounds_reward"]
-
-
-    def _updateTrajectory(self):
-
-        self.state_trajectory.append(self.new_state)
-        self.reward_trajectory.append(self.reward)
-        self.drone_trajectory.append([self.x, self.y])
-
-
-    def step(self, action):
-
-        self.action = action
-        self._applyRLactions(action)
-        self._computeReward()
-        self._checkDone()
-        self._updateTrajectory()
-
-        info = {}
-        return self.new_state, self.reward, self.done, info
-
+        try:
+            self.viewer.run()
+            return np.swapaxes(self.viewer.get_display_as_array(), 0, 1)
+        except pg.error:
+            # if the window was closed, recreate the viewer
+            self.viewer = Viewer(self, self.conf["viewer"])
+            self.viewerActive = True
+            self.viewer.run()
+            return np.swapaxes(self.viewer.get_display_as_array(), 0, 1)
 
     def close(self):
         if self.viewerActive:
