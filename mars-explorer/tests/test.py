@@ -53,6 +53,8 @@ if __name__ == "__main__":
     conf["obstacles"] = 20
     conf["lidar_range"] = 4
     conf["obstacle_size"] = [1,3]
+    conf["env_mode"] = "sim"
+    conf["slip_prob"] = 1.0
 
     seed = 42
 
@@ -77,11 +79,11 @@ for step in range(20):
     # get obs for each agent
     obs_list = [env._get_obs(i) for i in range(env.n_agents)]
 
-    for agent_idx, obs in enumerate(obs_list):
-        print(f"\nAgent {agent_idx} observation shape: {obs.shape}")
-        for channel in range(obs.shape[2]):
-            print(f"--- Channel {channel} ---")
-            print(obs[:, :, channel])
+    # for agent_idx, obs in enumerate(obs_list):
+    #     print(f"\nAgent {agent_idx} observation shape: {obs.shape}")
+    #     for channel in range(obs.shape[2]):
+    #         print(f"--- Channel {channel} ---")
+    #         print(obs[:, :, channel])
 
     for i in range(env.n_agents):
         if done[i] and rewards[i] != -400:
