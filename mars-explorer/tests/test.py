@@ -54,7 +54,7 @@ if __name__ == "__main__":
     conf["lidar_range"] = 4
     conf["obstacle_size"] = [1,3]
     conf["env_mode"] = "sim"
-    conf["slip_prob"] = 1.0
+    conf["slip_prob"] = 0.5
 
     seed = 42
 
@@ -102,8 +102,8 @@ for step in range(20):
         observation = env.reset(seed=seed)
         done = [False]*env.n_agents
 
-    test = input("hi")
-    #time.sleep(0.3)
+    #test = input("hi")
+    time.sleep(0.3)
     print("-"*40)
 
     env.close()

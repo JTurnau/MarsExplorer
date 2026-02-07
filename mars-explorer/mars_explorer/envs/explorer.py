@@ -24,13 +24,17 @@ class ExplorerMA(gym.Env):
 
         self.last_actions = [0, 0]
 
-        self.action_space = spaces.MultiDiscrete([4]*self.n_agents)
+        self.action_space = [gym.spaces.Discrete(4) for _ in range(self.n_agents)]
+
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.sizeX, self.sizeY, 2),
+            shape=(self.sizeX, self.sizeY, 3),
             dtype=np.float32
         )
+
+        # shared explored map
+        self.exploredMap = np.zeros(self.SIZE, dtype=np.double)
 
 
         self.viewerActive = False
@@ -84,9 +88,7 @@ class ExplorerMA(gym.Env):
 
     def _choice(self, agent_idx, action):
         dx, dy = 0, 0
-
-        print(f"Agent {agent_idx} choice")
-
+        
         if action == 0: dx = 1
         elif action == 1: dx = -1
         elif action == 2: dy = 1
