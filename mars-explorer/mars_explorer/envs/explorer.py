@@ -63,11 +63,20 @@ class ExplorerMA(gym.Env):
         self.exploredMap = np.zeros(self.SIZE, dtype=np.double)
 
         # initialize agent positions
-        initial = self.conf.get("initial", [0,0])
+        initial = self.conf.get("initial")
         self.positions = []
+
+        first_placement = True  # First placement flag to separate agents by 2 on x-axis after first placement
+
         for i in range(self.n_agents):
-            x = initial[0] + i
-            y = initial[1]
+            if first_placement:
+                x = initial[0]
+                y = initial[1]
+            else:
+                x = initial[0] + 2
+                y = initial[1]
+            
+            first_placement = False
             self.positions.append([x, y])
 
         # trajectories and rewards
@@ -157,12 +166,22 @@ class ExplorerMA(gym.Env):
         #     self.exploredMap[pos[0], pos[1]] = 0.6
 
     def _computeReward(self):
-        new_explored = int(np.count_nonzero(self.exploredMap))
-        old_explored = int(np.count_nonzero(self.pastExploredMap))
-        reward_increment = new_explored - old_explored
+        claimed = np.zeros(self.SIZE, dtype=bool)
         for i in range(self.n_agents):
-            if self.rewards[i] == 0:
-                self.rewards[i] = float(reward_increment - self.movementCost)
+            if self.rewards[i] != 0:
+                continue
+
+            lidar_idx = self.lidarIndexes[i]
+            new_cells = 0
+            for x, y in lidar_idx:
+                if self.exploredMap[x, y] != self.pastExploredMap[x, y] and not claimed[x, y]:
+                    new_cells += 1
+                    claimed[x, y] = True  # mark cell as claimed
+
+            self.rewards[i] = float(new_cells - self.movementCost)
+
+
+
 
     def step(self, actions):
         if isinstance(actions, np.ndarray):
@@ -191,8 +210,8 @@ class ExplorerMA(gym.Env):
                 collided_agent = positions_seen[pos_tuple]
                 self.dones[i] = True
                 self.dones[collided_agent] = True
-                self.rewards[i] = self.conf.get("collision_reward", -400)
-                self.rewards[collided_agent] = self.conf.get("collision_reward", -400)
+                self.rewards[i] = self.conf.get("collision_reward")
+                self.rewards[collided_agent] = self.conf.get("collision_reward")
             else:
                 positions_seen[pos_tuple] = i
         # ------------------------------------------------------------------------
