@@ -8,10 +8,7 @@ import random
 import os
 from datetime import datetime
 
-# Import the environment
 from mars_explorer.envs.explorer import ExplorerMALocalObs
-
-# Import the default config
 from mars_explorer.envs.settings import DEFAULT_CONFIG as conf
 
 
@@ -202,8 +199,63 @@ class IndependentDQN:
         print(f"Model loaded from {path}")
 
 
+def evaluate_deterministic(env_config, agent, obs_size, n_eval_episodes=1, seed=22):
+    """
+    Run deterministic evaluation episodes.
+    
+    Args:
+        env_config: Environment configuration dictionary
+        agent: Trained agent
+        obs_size: Size of local observation window
+        n_eval_episodes: Number of evaluation episodes
+        seed: Seed for reproducibility
+    
+    Returns:
+        avg_reward: Average reward across evaluation episodes
+        avg_coverage: Average coverage across evaluation episodes
+        avg_length: Average episode length
+    """
+    env = ExplorerMALocalObs(conf=env_config)
+    n_agents = env.n_agents
+    
+    eval_rewards = []
+    eval_coverages = []
+    eval_lengths = []
+    
+    for _ in range(n_eval_episodes):
+        obs, info = env.reset(seed=seed)
+        episode_reward = [0] * n_agents
+        episode_length = 0
+        done = False
+        
+        while not done:
+            # Select actions deterministically (no exploration)
+            actions = [agent.select_action(obs[i], eval_mode=True) for i in range(n_agents)]
+            
+            # Step environment
+            next_obs, rewards, terminated, truncated, info = env.step(actions)
+            done = terminated or truncated
+            
+            for i in range(n_agents):
+                episode_reward[i] += rewards[i]
+            
+            obs = next_obs
+            episode_length += 1
+        
+        # Calculate coverage
+        total_cells = env.SIZE[0] * env.SIZE[1]
+        explored_cells = np.count_nonzero(env.exploredMap)
+        coverage = explored_cells / total_cells
+        
+        eval_rewards.append(np.mean(episode_reward))
+        eval_coverages.append(coverage)
+        eval_lengths.append(episode_length)
+    
+    return np.mean(eval_rewards), np.mean(eval_coverages), np.mean(eval_lengths)
+
+
 def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10, 
-               checkpoint_dir='checkpoints', device='cuda', obs_size=7):
+               checkpoint_dir='checkpoints', device='cuda', obs_size=7, eval_freq=10):
     """
     Train Independent DQN with parameter sharing on multi-agent environment.
     
@@ -214,7 +266,8 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
         log_freq: Log progress every N episodes
         checkpoint_dir: Directory to save checkpoints
         device: 'cuda' or 'cpu'
-        obs_size: Size of local observation window (e.g., 7 for 7x7)
+        obs_size: Size of local observation window (7 for 7x7)
+        eval_freq: Run deterministic evaluation every N episodes
     """
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -233,7 +286,7 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
         learning_rate=1e-4,
         gamma=0.99,
         epsilon_start=1.0,
-        epsilon_end=0.01,
+        epsilon_end=0.05,
         epsilon_decay=0.995,
         buffer_capacity=100000,
         batch_size=128,
@@ -247,14 +300,24 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
     losses = []
     coverage_rates = []
     
+    # Evaluation metrics
+    eval_rewards = []
+    eval_coverages = []
+    eval_lengths = []
+    eval_episodes = []
+    
+    # Track best model
+    best_eval_reward = -float('inf')
+    
     print(f"Starting training with {n_agents} agents")
     print(f"Observation size: {obs_size}x{obs_size}")
     print(f"Device: {device}")
     print(f"Checkpoint directory: {run_dir}")
+    print(f"Evaluation frequency: every {eval_freq} episodes")
     print("-" * 60)
     
     for episode in range(n_episodes):
-        obs, info = env.reset(seed=42)
+        obs, info = env.reset(seed=22)
         episode_reward = [0] * n_agents
         episode_length = 0
         done = False
@@ -294,6 +357,30 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
         episode_lengths.append(episode_length)
         coverage_rates.append(coverage)
         
+        # Run deterministic evaluation
+        if (episode + 1) % eval_freq == 0:
+            eval_reward, eval_coverage, eval_length = evaluate_deterministic(
+                env_config, agent, obs_size, n_eval_episodes=1, seed=22
+            )
+            eval_rewards.append(eval_reward)
+            eval_coverages.append(eval_coverage)
+            eval_lengths.append(eval_length)
+            eval_episodes.append(episode + 1)
+            
+            print(f"\n{'='*60}")
+            print(f"DETERMINISTIC EVALUATION at Episode {episode + 1}")
+            print(f"  Eval Reward: {eval_reward:.2f}")
+            print(f"  Eval Coverage: {eval_coverage:.2%}")
+            print(f"  Eval Length: {eval_length:.1f}")
+            print(f"{'='*60}\n")
+            
+            # Save best model
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                best_model_path = os.path.join(run_dir, 'best_model.pt')
+                agent.save(best_model_path)
+                print(f"*** NEW BEST MODEL saved with eval reward: {eval_reward:.2f} ***\n")
+        
         # Logging
         if (episode + 1) % log_freq == 0:
             avg_loss = np.mean(losses[-100:]) if losses else 0
@@ -308,6 +395,7 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
             print(f"  Epsilon: {agent.epsilon:.3f}")
             print(f"  Avg Loss: {avg_loss:.4f}")
             print(f"  Buffer Size: {len(agent.replay_buffer)}")
+            print(f"  Best Eval Reward: {best_eval_reward:.2f}")
             print("-" * 60)
         
         # Save checkpoint
@@ -320,7 +408,12 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
                 'episode_rewards': episode_rewards,
                 'episode_lengths': episode_lengths,
                 'coverage_rates': coverage_rates,
-                'losses': losses
+                'losses': losses,
+                'eval_rewards': eval_rewards,
+                'eval_coverages': eval_coverages,
+                'eval_lengths': eval_lengths,
+                'eval_episodes': eval_episodes,
+                'best_eval_reward': best_eval_reward
             }
             metrics_path = os.path.join(run_dir, 'metrics.npy')
             np.save(metrics_path, metrics)
@@ -331,6 +424,8 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
     
     print("\nTraining completed!")
     print(f"Final model saved to {final_path}")
+    print(f"Best model saved to {os.path.join(run_dir, 'best_model.pt')}")
+    print(f"Best eval reward: {best_eval_reward:.2f}")
     
     return agent, episode_rewards, episode_lengths, coverage_rates
 
@@ -339,9 +434,9 @@ if __name__ == '__main__':
     # Example environment configuration
     conf["n_agents"] = 2
     conf["shared_map"] = True
-    conf["size"] = [15, 15]
+    conf["size"] = [30, 30]
     conf["obstacles"] = 10
-    conf["lidar_range"] = 5
+    conf["lidar_range"] = 2
     conf["obstacle_size"] = [1, 3]
     conf["env_mode"] = "sim"
     conf["slip_prob"] = 0.0
@@ -349,17 +444,19 @@ if __name__ == '__main__':
     conf["collision_reward"] = -50
     conf["out_of_bounds_reward"] = -50
     conf["movementCost"] = 0.1
-    
+    conf["max_steps"] = 200
+
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+
     # Train the agent with 7x7 observations
     agent, rewards, lengths, coverage = train_idqn(
         env_config=conf,
-        n_episodes=5000,
+        n_episodes=1500,
         save_freq=100,
         log_freq=10,
         checkpoint_dir='checkpoints',
         device=device,
-        obs_size=7  # IMPORTANT: Set this to match your environment's observation size
+        obs_size=7,
+        eval_freq=10
     )

@@ -22,6 +22,12 @@ class ExplorerMALocalObs(gym.Env):
     
     Episode terminates if ANY agent collides or goes out of bounds.
     Uses Gymnasium API (returns 5 values from step).
+    
+    MODIFICATION FOR SIM-TO-REAL TRANSFER:
+    - When env_mode="sim": deterministic transitions (no slip)
+    - When env_mode="real": stochastic transitions with slip_prob
+      * With probability (1 - slip_prob): execute intended action
+      * With probability slip_prob: execute uniformly random action
     """
     metadata = {'render.modes': ['rgb_array'],
                 'video.frames_per_second': 6}
@@ -69,13 +75,13 @@ class ExplorerMALocalObs(gym.Env):
 
     def reset(self, seed=None, options=None):
         """Reset environment. Returns (observation, info) tuple."""
-        if seed is not None:
-            self.seed(seed)
-
+        # CRITICAL: Only use seed for map generation, not for episode RNG
+        # This ensures the map is fixed but slip events are random across episodes
+        
         self.maxSteps = self.conf["max_steps"]
         self.exploration_done = False
 
-        # Generate map
+        # Generate map with the provided seed (for consistent map layout)
         gen = Generator(self.conf, seed=seed)
         randomMap = gen.get_map().astype(np.double)
         randomMapOriginal = randomMap.copy()
@@ -176,18 +182,35 @@ class ExplorerMALocalObs(gym.Env):
         return obs
 
     def _choice(self, agent_idx, action):
-        dx, dy = 0, 0
+        """
+        Execute action with potential slip based on environment mode.
         
-        if action == 0: dx = 1
-        elif action == 1: dx = -1
-        elif action == 2: dy = 1
-        elif action == 3: dy = -1
-
-        # If the environment mode is set to 'real', apply slip probability
+        SIM-TO-REAL TRANSFER MECHANISM:
+        - env_mode="sim": Execute intended action deterministically
+        - env_mode="real": With probability slip_prob, execute random action instead
+        
+        IMPORTANT: Uses np.random.default_rng() for slip to ensure true randomness
+        across episodes even when map seed is fixed.
+        """
+        actual_action = action
+        
+        # Apply slip probability if in real mode
         if self.conf.get("env_mode") == "real":
-            if np.random.rand() < self.conf.get("slip_prob", 0.0):
-                print(f"Agent {agent_idx} slipped")
-                dx, dy = 0, 0
+            # Use default_rng() for true randomness (not affected by np.random.seed)
+            # This ensures different slip patterns across episodes with same map seed
+            slip_rng = np.random.default_rng()
+            if slip_rng.random() < self.conf.get("slip_prob", 0.0):
+                # Slip: take a uniformly random action instead of intended action
+                actual_action = slip_rng.integers(0, 4)
+                if self.conf.get("verbose_slip", False):
+                    action_names = ['right', 'left', 'down', 'up']
+                    print(f"Agent {agent_idx} slipped! Intended: {action_names[action]}, Actual: {action_names[actual_action]}")
+        
+        dx, dy = 0, 0
+        if actual_action == 0: dx = 1
+        elif actual_action == 1: dx = -1
+        elif actual_action == 2: dy = 1
+        elif actual_action == 3: dy = -1
         
         self._move(agent_idx, dx, dy)
 
@@ -296,11 +319,11 @@ class ExplorerMALocalObs(gym.Env):
         explored_cells = np.count_nonzero(self.exploredMap)
         coverage = explored_cells / total_cells
 
-        if (not self.exploration_done) and coverage >= self.conf.get("explore_threshold", 0.9):
+        if (not self.exploration_done) and coverage >= self.conf.get("explore_threshold", 0.90):
             self.exploration_done = True
             # Bonus reward for completing exploration
             for i in range(self.n_agents):
-                self.rewards[i] += self.conf.get("explore_bonus", 500.0)
+                self.rewards[i] += self.conf.get("explore_bonus", 500)
             terminated = True
 
         # Max steps termination (truncation, not termination)
