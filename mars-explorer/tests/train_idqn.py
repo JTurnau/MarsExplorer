@@ -431,10 +431,9 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
 
 
 if __name__ == '__main__':
-    # Example environment configuration
     conf["n_agents"] = 2
     conf["shared_map"] = True
-    conf["size"] = [30, 30]
+    conf["size"] = [15, 15]
     conf["obstacles"] = 10
     conf["lidar_range"] = 2
     conf["obstacle_size"] = [1, 3]

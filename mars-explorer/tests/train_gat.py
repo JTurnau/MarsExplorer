@@ -310,7 +310,7 @@ class PerAgentGAT:
         obs_t      = torch.FloatTensor(obs).to(self.device)
         next_obs_t = torch.FloatTensor(next_obs).to(self.device)
 
-        # Supervised on actual sim transitions: (obs, next_obs) → action
+        # Supervised on sim transitions: (obs, next_obs) → action
         logits = im(obs_t, next_obs_t)
         loss   = F.cross_entropy(logits, torch.LongTensor(actions).to(self.device))
 
@@ -578,12 +578,10 @@ def finetune_with_gat(
 
             # 3. Step sim with grounded actions
             next_obs, rewards, terminated, truncated, _ = env.step(grounded)
-            done = terminated or truncated
+            done = terminated or Truncated
 
-            # 4. Store grounded action — the policy must learn the value of the
-            #    action that was actually executed in the environment.
+            # 4. Store transitions
             for i in range(n_agents):
-                #agent.store_transition(obs[i], grounded[i], rewards[i], next_obs[i], done)
                 agent.store_transition(obs[i], intended[i], rewards[i], next_obs[i], done)
                 ep_reward[i] += rewards[i]
 
