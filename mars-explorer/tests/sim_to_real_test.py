@@ -14,6 +14,7 @@ import argparse
 import os
 from datetime import datetime
 import json
+from scipy import stats
 
 # Import the environment
 from mars_explorer.envs.explorer import ExplorerMALocalObs
@@ -217,21 +218,54 @@ def evaluate_sim_to_real_transfer(
     # Calculate real statistics
     real_stats = {
         'mean_reward': np.mean(real_results['episode_rewards']),
-        'std_reward': np.std(real_results['episode_rewards']),
+        'std_reward': np.std(real_results['episode_rewards'], ddof=1),
         'mean_length': np.mean(real_results['episode_lengths']),
-        'std_length': np.std(real_results['episode_lengths']),
+        'std_length': np.std(real_results['episode_lengths'], ddof=1),
         'mean_coverage': np.mean(real_results['coverage_rates']),
-        'std_coverage': np.std(real_results['coverage_rates']),
+        'std_coverage': np.std(real_results['coverage_rates'], ddof=1),
         'success_rate': real_results['success_count'] / n_real_episodes,
         'collision_rate': real_results['collision_count'] / n_real_episodes,
         'truncation_rate': real_results['truncation_count'] / n_real_episodes
     }
+
+    n = len(real_results['episode_rewards'])
+
+    # Coverage CI
+    coverage_ci = stats.t.interval(
+        0.95,
+        df=n-1,
+        loc=real_stats['mean_coverage'],
+        scale=stats.sem(real_results['coverage_rates'])
+    )
+
+    # Reward CI
+    reward_ci = stats.t.interval(
+        0.95,
+        df=n-1,
+        loc=real_stats['mean_reward'],
+        scale=stats.sem(real_results['episode_rewards'])
+    )
+
+    # Length CI
+    length_ci = stats.t.interval(
+        0.95,
+        df=n-1,
+        loc=real_stats['mean_length'],
+        scale=stats.sem(real_results['episode_lengths'])
+    )
+    real_stats['length_ci_95'] = length_ci
+
+    real_stats['coverage_ci_95'] = coverage_ci
+    real_stats['reward_ci_95'] = reward_ci
     
     print("\n" + "-" * 80)
     print(f"REAL ENVIRONMENT RESULTS ({n_real_episodes} episodes with random slip):")
     print(f"  Mean Reward: {real_stats['mean_reward']:.2f} ± {real_stats['std_reward']:.2f}")
+    print(f"  Reward 95% CI:  [{reward_ci[0]:.2f}, {reward_ci[1]:.2f}]")
     print(f"  Mean Length: {real_stats['mean_length']:.1f} ± {real_stats['std_length']:.1f}")
+    print(f"  Length 95% CI:  [{length_ci[0]:.1f}, {length_ci[1]:.1f}]")
     print(f"  Mean Coverage: {real_stats['mean_coverage']:.2%} ± {real_stats['std_coverage']:.2%}")
+    print(f"  Coverage 95% CI:[{coverage_ci[0]:.2%}, {coverage_ci[1]:.2%}]")
     print(f"  Success Rate: {real_stats['success_rate']:.1%}")
     print(f"  Collision Rate: {real_stats['collision_rate']:.1%}")
     print(f"  Truncation Rate: {real_stats['truncation_rate']:.1%}")
@@ -470,7 +504,7 @@ if __name__ == '__main__':
     # Environment configuration
     conf["n_agents"] = 2
     conf["shared_map"] = True
-    conf["size"] = [30, 30]
+    conf["size"] = [15, 15]
     conf["obstacles"] = 10
     conf["lidar_range"] = 2
     conf["obstacle_size"] = [1, 3]
