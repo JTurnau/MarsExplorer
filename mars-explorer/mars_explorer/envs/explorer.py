@@ -196,12 +196,11 @@ class ExplorerMALocalObs(gym.Env):
         
         # Apply slip probability if in real mode
         if self.conf.get("env_mode") == "real":
-            # Use default_rng() for true randomness (not affected by np.random.seed)
-            # This ensures different slip patterns across episodes with same map seed
             slip_rng = np.random.default_rng()
             if slip_rng.random() < self.conf.get("slip_prob", 0.0):
                 # Slip: take a uniformly random action instead of intended action
-                actual_action = slip_rng.integers(0, 4)
+                other_actions = [a for a in range(4) if a != action]
+                actual_action = int(slip_rng.choice(other_actions))
                 if self.conf.get("verbose_slip", False):
                     action_names = ['right', 'left', 'down', 'up']
                     print(f"Agent {agent_idx} slipped! Intended: {action_names[action]}, Actual: {action_names[actual_action]}")

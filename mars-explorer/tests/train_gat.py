@@ -578,7 +578,7 @@ def finetune_with_gat(
 
             # 3. Step sim with grounded actions
             next_obs, rewards, terminated, truncated, _ = env.step(grounded)
-            done = terminated or Truncated
+            done = terminated or truncated
 
             # 4. Store transitions
             for i in range(n_agents):
