@@ -1,17 +1,27 @@
 """
 Multi-Agent Grounded Action Transformation (MA-GAT) for Sim-to-Real Transfer
+with optional Stochastic GAT (SGAT) support.
 
-This script implements two variants of GAT for a multi-agent exploration task:
-  1. Shared GAT   – all agents share a single forward model and a single inverse model
-  2. Decentralized GAT – each agent has its own forward model and inverse model
+Two training modes:
+  --mode finetune   : Load a pre-trained IDQN checkpoint, finetune with GAT/SGAT
+  --mode scratch    : Train IDQN from scratch inside the GAT/SGAT loop
 
-Pipeline:
-  1. Collect real-world trajectories (sim-to-sim with different dynamics / slip)
-  2. Collect simulation trajectories
-  3. Train forward models on real trajectories (learns P_real(s'|s,a))
-  4. Train inverse models on sim trajectories (learns grounded action π_inv(s,s'))
-  5. Fine-tune the DQN policy in sim using the grounded (transformed) actions
+Two GAT variants:
+  --variant shared     : All agents share one forward model + one inverse model
+  --variant per_agent  : Each agent has its own forward + inverse model
 
+Stochasticity flag:
+  --sgat            : Use Stochastic GAT (SGAT). The forward model outputs a
+                      Gaussian distribution (mean + log_std) and samples from it
+                      during grounding, rather than predicting a single next state.
+                      This captures real-world stochasticity that deterministic GAT
+                      misses.
+
+Key fixes vs previous version:
+  1. From-scratch mode trains IDQN with epsilon exploration inside the GAT loop
+  2. Replay buffer stores GROUNDED actions (what was actually executed), not intended
+  3. Best model selected by real-environment validation coverage (not reward)
+  4. Finetuning mode retains small epsilon for stability
 """
 
 import numpy as np
@@ -25,7 +35,6 @@ import os
 import json
 import argparse
 from datetime import datetime
-from copy import deepcopy
 
 from mars_explorer.envs.explorer import ExplorerMALocalObs
 from mars_explorer.envs.settings import DEFAULT_CONFIG as conf
@@ -38,19 +47,18 @@ from train_idqn import DQN_CNN, IndependentDQN, ReplayBuffer
 
 class ForwardModel(nn.Module):
     """
-    Predicts the next observation in the *real* environment.
+    Deterministic forward model. Predicts next observation under "real" environment dynamics.
 
-    Input:  flat(obs_t)  ||  one_hot(action_t)   dim = obs_dim + n_actions
-    Output: flat(obs_{t+1})                       dim = obs_dim
+    Input:  flat(obs_t) || one_hot(action_t)    dim = obs_dim + n_actions
+    Output: flat(obs_{t+1})                      dim = obs_dim
 
-    Trained exclusively on real-world (high-slip) trajectories.
+    Trained with MSE loss on real-world trajectories.
     """
 
     def __init__(self, obs_dim: int, n_actions: int, hidden_dim: int = 256):
         super().__init__()
         self.obs_dim   = obs_dim
         self.n_actions = n_actions
-
         self.net = nn.Sequential(
             nn.Linear(obs_dim + n_actions, hidden_dim),
             nn.ReLU(),
@@ -60,34 +68,76 @@ class ForwardModel(nn.Module):
         )
 
     def forward(self, obs: torch.Tensor, action_onehot: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([obs, action_onehot], dim=-1)
-        return self.net(x)
+        return self.net(torch.cat([obs, action_onehot], dim=-1))
+
+
+class StochasticForwardModel(nn.Module):
+    """
+    Stochastic forward model for SGAT. Predicts a *distribution* over next
+    observations under "real" environment dynamics instead of a single point estimate.
+
+    Architecture:
+      - A shared trunk encodes (obs_t, action_t)
+      - Two output heads produce mean and log_std for each obs dimension
+      - At inference, a next state is sampled: next_obs ~ N(mean, std^2)
+
+    Input:  flat(obs_t) || one_hot(action_t)              dim = obs_dim + n_actions
+    Output: (mean, log_std) each of shape (batch, obs_dim)
+
+    Trained with Gaussian NLL loss on real-world trajectories:
+        L = 0.5 * sum[ log(std^2) + (next_obs - mean)^2 / std^2 ]
+    """
+
+    def __init__(self, obs_dim: int, n_actions: int, hidden_dim: int = 256,
+                 log_std_min: float = -5.0, log_std_max: float = 2.0):
+        super().__init__()
+        self.obs_dim     = obs_dim
+        self.n_actions   = n_actions
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim + n_actions, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.mean_head    = nn.Linear(hidden_dim, obs_dim)
+        self.log_std_head = nn.Linear(hidden_dim, obs_dim)
+
+    def forward(self, obs: torch.Tensor,
+                action_onehot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h       = self.trunk(torch.cat([obs, action_onehot], dim=-1))
+        mean    = self.mean_head(h)
+        log_std = self.log_std_head(h).clamp(self.log_std_min, self.log_std_max)
+        return mean, log_std
+
+    def sample(self, obs: torch.Tensor,
+               action_onehot: torch.Tensor) -> torch.Tensor:
+        """Sample a next observation from the predicted Gaussian distribution."""
+        mean, log_std = self(obs, action_onehot)
+        std           = log_std.exp()
+        eps           = torch.randn_like(mean)
+        return mean + std * eps     # reparameterised sample
 
 
 class InverseModel(nn.Module):
     """
-    Produces a *grounded* action that bridges sim and real dynamics.
+    Maps (obs_t, predicted_real_next_obs) → grounded sim action.
 
-    Input:  flat(obs_t)  ||  flat(obs_{t+1})   dim = 2 * obs_dim
-    Output: logits over actions                  dim = n_actions
+    Input:  flat(obs_t) || flat(obs_{t+1})    dim = 2 * obs_dim
+    Output: logits over actions                dim = n_actions
 
-    Training: Trained on simulation (obs, action, next_obs) triples.
-              Learns to reconstruct the action that caused a given (obs → next_obs)
-              transition in sim. This means at inference time, when we feed it
-              (obs, forward_model_prediction), it will output whichever sim action
-              is most likely to produce that predicted next state.
-
-    Inference: Receives (obs_t, forward_model(obs_t, intended_action)) as input,
-               where the forward model has been trained on *real* dynamics.
-               The inverse model therefore maps the real-predicted next state back
-               to the sim action that best replicates it — the grounded action.
+    Trained on SIM (obs, action, next_obs) triples using cross-entropy.
+    At inference, next_obs is replaced by the forward model's real-dynamics
+    prediction (deterministic GAT) or sample (SGAT), so the inverse model
+    outputs the sim action that best replicates that real-dynamics outcome.
     """
 
     def __init__(self, obs_dim: int, n_actions: int, hidden_dim: int = 256):
         super().__init__()
         self.obs_dim   = obs_dim
         self.n_actions = n_actions
-
         self.net = nn.Sequential(
             nn.Linear(2 * obs_dim, hidden_dim),
             nn.ReLU(),
@@ -97,17 +147,40 @@ class InverseModel(nn.Module):
         )
 
     def forward(self, obs: torch.Tensor, next_obs: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([obs, next_obs], dim=-1)
-        return self.net(x)   # raw logits; caller applies argmax or softmax
+        return self.net(torch.cat([obs, next_obs], dim=-1))
 
 
 # ---------------------------------------------------------------------------
-# GAT Agent Wrappers
+# Gaussian NLL Loss Helper
+# ---------------------------------------------------------------------------
+
+def gaussian_nll_loss(mean: torch.Tensor, log_std: torch.Tensor,
+                      target: torch.Tensor) -> torch.Tensor:
+    """
+    Element-wise Gaussian NLL, averaged over batch and state dimensions.
+
+    L = 0.5 * mean_over_dims[ 2*log_std + (target - mean)^2 / exp(2*log_std) ]
+
+    This is equivalent to -log p(target | mean, std) under N(mean, std^2),
+    up to a constant. Minimizing this teaches the model the correct spread as
+    well as the correct centre.
+    """
+    var  = (2 * log_std).exp()                          # std^2
+    loss = 0.5 * (2 * log_std + (target - mean).pow(2) / var)
+    return loss.mean()
+
+
+# ---------------------------------------------------------------------------
+# GAT Agent Wrappers  (Shared)
 # ---------------------------------------------------------------------------
 
 class SharedGAT:
     """
-    Single forward + inverse model shared across all agents (parameter sharing).
+    Deterministic GAT — single forward + inverse model shared across all agents.
+
+    ground_action: obs + intended_action
+        forward model predicts single next state
+        inverse model selects grounded action
     """
 
     def __init__(self, obs_size: int, n_actions: int, n_agents: int,
@@ -118,27 +191,18 @@ class SharedGAT:
         self.n_agents  = n_agents
         self.device    = device
 
-        self.forward_model  = ForwardModel(self.obs_dim, n_actions).to(device)
-        self.inverse_model  = InverseModel(self.obs_dim, n_actions).to(device)
-
-        self.fm_optimizer = optim.Adam(self.forward_model.parameters(), lr=lr)
-        self.im_optimizer = optim.Adam(self.inverse_model.parameters(), lr=lr)
-
-    # ------------------------------------------------------------------
-    # Grounded-action inference  (used during fine-tuning)
-    # ------------------------------------------------------------------
+        self.forward_model = ForwardModel(self.obs_dim, n_actions).to(device)
+        self.inverse_model = InverseModel(self.obs_dim, n_actions).to(device)
+        self.fm_optimizer  = optim.Adam(self.forward_model.parameters(), lr=lr)
+        self.im_optimizer  = optim.Adam(self.inverse_model.parameters(), lr=lr)
 
     def ground_action(self, obs: np.ndarray, intended_action: int) -> int:
         """
-        Given the agent's intended action (from DQN policy), return the
-        grounded action that accounts for the sim/real dynamics gap.
+        Transform intended action → grounded action via forward + inverse models.
 
-        Steps:
-          1. ForwardModel predicts where the agent would end up in the *real* env
-             (forward model was trained on real trajectories).
-          2. InverseModel maps (obs, real_predicted_next_obs) → grounded action.
-             Since the inverse model was trained on sim transitions, it will output
-             the sim action that best reproduces the real-dynamics next state.
+        1. Forward model predicts where "real" environment dynamics would take the agent.
+        2. Inverse model asks: which SIM action produces that same next state?
+        That sim action is the grounded action — it compensates for the gap.
         """
         self.forward_model.eval()
         self.inverse_model.eval()
@@ -147,26 +211,12 @@ class SharedGAT:
             a_onehot = F.one_hot(
                 torch.tensor([intended_action]), num_classes=self.n_actions
             ).float().to(self.device)
-
-            # Forward model predicts where real dynamics would take us
-            pred_real_next = self.forward_model(obs_t, a_onehot)      # (1, obs_dim)
-
-            # Inverse model asks: which sim action leads to this next state?
-            logits   = self.inverse_model(obs_t, pred_real_next)       # (1, n_actions)
-            grounded = logits.argmax(dim=-1).item()
-        return grounded
-
-    # ------------------------------------------------------------------
-    # Training steps
-    # ------------------------------------------------------------------
+            pred_real_next = self.forward_model(obs_t, a_onehot)
+            logits         = self.inverse_model(obs_t, pred_real_next)
+            return logits.argmax(dim=-1).item()
 
     def train_forward_step(self, batch):
-        """
-        One gradient step on the forward model using a batch of *real* transitions.
-        Teaches the forward model P_real(s' | s, a).
-
-        batch: (obs, actions, next_obs)  – numpy arrays, collected from real env
-        """
+        """MSE on real transitions: (obs, action) → next_obs."""
         self.forward_model.train()
         obs, actions, next_obs = batch
         obs_t      = torch.FloatTensor(obs).to(self.device)
@@ -174,40 +224,19 @@ class SharedGAT:
             torch.LongTensor(actions).to(self.device), num_classes=self.n_actions
         ).float()
         next_obs_t = torch.FloatTensor(next_obs).to(self.device)
-
-        pred_next = self.forward_model(obs_t, a_onehot)
-        loss = F.mse_loss(pred_next, next_obs_t)
-
-        self.fm_optimizer.zero_grad()
-        loss.backward()
-        self.fm_optimizer.step()
+        loss = F.mse_loss(self.forward_model(obs_t, a_onehot), next_obs_t)
+        self.fm_optimizer.zero_grad(); loss.backward(); self.fm_optimizer.step()
         return loss.item()
 
     def train_inverse_step(self, batch):
-        """
-        One gradient step on the inverse model using a batch of *sim* transitions.
-        Teaches the inverse model π_inv(a | s, s') using only sim data.
-
-        The inverse model learns: given (obs_t, next_obs_t) from sim, predict the
-        action that caused that transition. At inference time, next_obs_t is replaced
-        by the forward model's real-dynamics prediction, so the inverse model
-        effectively outputs the sim action that best replicates real-world outcomes.
-
-        batch: (obs, actions, next_obs)  - numpy arrays, collected from sim env
-        """
+        """Cross-entropy on sim transitions: (obs, next_obs) → action."""
         self.inverse_model.train()
         obs, actions, next_obs = batch
         obs_t      = torch.FloatTensor(obs).to(self.device)
         next_obs_t = torch.FloatTensor(next_obs).to(self.device)
-
-        # Directly supervised: given the actual sim transition (obs → next_obs),
-        # predict the action that caused it.
         logits = self.inverse_model(obs_t, next_obs_t)
         loss   = F.cross_entropy(logits, torch.LongTensor(actions).to(self.device))
-
-        self.im_optimizer.zero_grad()
-        loss.backward()
-        self.im_optimizer.step()
+        self.im_optimizer.zero_grad(); loss.backward(); self.im_optimizer.step()
         return loss.item()
 
     def save(self, path: str):
@@ -228,10 +257,99 @@ class SharedGAT:
         print(f"[SharedGAT] Loaded from {path}")
 
 
+class SharedSGAT(SharedGAT):
+    """
+    Stochastic GAT — single stochastic forward model + inverse model shared
+    across all agents.
+
+    The only difference from SharedGAT:
+      1. forward_model is a StochasticForwardModel (outputs mean + log_std)
+      2. train_forward_step uses Gaussian NLL instead of MSE
+      3. ground_action SAMPLES from the predicted distribution instead of
+         taking the argmax / point prediction
+
+    By sampling, the grounded simulator inherits the real world's stochastic
+    transition structure, allowing the policy to learn risk-averse behaviour
+    that pure deterministic GAT cannot capture.
+    """
+
+    def __init__(self, obs_size: int, n_actions: int, n_agents: int,
+                 lr: float = 1e-3, device: str = 'cuda'):
+        # Initialise base class to get inverse model + optimiser boilerplate
+        super().__init__(obs_size, n_actions, n_agents, lr, device)
+
+        # Replace deterministic forward model with stochastic version
+        self.forward_model = StochasticForwardModel(self.obs_dim, n_actions).to(device)
+        self.fm_optimizer  = optim.Adam(self.forward_model.parameters(), lr=lr)
+
+    # --- Override: sample instead of point-predict ---------------------------
+    def ground_action(self, obs: np.ndarray, intended_action: int) -> int:
+        """
+        Grounding with stochastic forward model:
+          1. Sample next_obs ~ N(mean, std^2) predicted by stochastic FM
+          2. Inverse model selects grounded action for that sampled next_obs
+
+        Because the sample varies each call, the grounded simulator is itself
+        stochastic — matching the stochasticity of the real environment and
+        enabling the downstream policy to learn appropriate risk-sensitive behaviour.
+        """
+        self.forward_model.eval()
+        self.inverse_model.eval()
+        with torch.no_grad():
+            obs_t    = torch.FloatTensor(obs.flatten()).unsqueeze(0).to(self.device)
+            a_onehot = F.one_hot(
+                torch.tensor([intended_action]), num_classes=self.n_actions
+            ).float().to(self.device)
+            # KEY DIFFERENCE vs GAT: sample from predicted distribution
+            sampled_next = self.forward_model.sample(obs_t, a_onehot)
+            logits       = self.inverse_model(obs_t, sampled_next)
+            return logits.argmax(dim=-1).item()
+
+    # --- Override: NLL loss instead of MSE -----------------------------------
+    def train_forward_step(self, batch):
+        """
+        Gaussian NLL on real transitions: (obs, action) → distribution over next_obs.
+
+        Unlike MSE, NLL penalises both incorrect means and incorrect variances,
+        so the model learns a calibrated uncertainty over next states.
+        """
+        self.forward_model.train()
+        obs, actions, next_obs = batch
+        obs_t      = torch.FloatTensor(obs).to(self.device)
+        a_onehot   = F.one_hot(
+            torch.LongTensor(actions).to(self.device), num_classes=self.n_actions
+        ).float()
+        next_obs_t = torch.FloatTensor(next_obs).to(self.device)
+
+        mean, log_std = self.forward_model(obs_t, a_onehot)
+        loss = gaussian_nll_loss(mean, log_std, next_obs_t)
+        self.fm_optimizer.zero_grad(); loss.backward(); self.fm_optimizer.step()
+        return loss.item()
+
+    def save(self, path: str):
+        torch.save({
+            'forward_model': self.forward_model.state_dict(),
+            'inverse_model': self.inverse_model.state_dict(),
+            'fm_optimizer':  self.fm_optimizer.state_dict(),
+            'im_optimizer':  self.im_optimizer.state_dict(),
+        }, path)
+        print(f"[SharedSGAT] Saved to {path}")
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        self.forward_model.load_state_dict(ckpt['forward_model'])
+        self.inverse_model.load_state_dict(ckpt['inverse_model'])
+        self.fm_optimizer.load_state_dict(ckpt['fm_optimizer'])
+        self.im_optimizer.load_state_dict(ckpt['im_optimizer'])
+        print(f"[SharedSGAT] Loaded from {path}")
+
+
+# ---------------------------------------------------------------------------
+# GAT Agent Wrappers  (Per-Agent)
+# ---------------------------------------------------------------------------
+
 class PerAgentGAT:
-    """
-    Each agent gets its own forward model and inverse model (no parameter sharing).
-    """
+    """Each agent has its own deterministic forward + inverse model."""
 
     def __init__(self, obs_size: int, n_actions: int, n_agents: int,
                  lr: float = 1e-3, device: str = 'cuda'):
@@ -242,22 +360,13 @@ class PerAgentGAT:
         self.device    = device
 
         self.forward_models = nn.ModuleList([
-            ForwardModel(self.obs_dim, n_actions).to(device)
-            for _ in range(n_agents)
+            ForwardModel(self.obs_dim, n_actions).to(device) for _ in range(n_agents)
         ])
         self.inverse_models = nn.ModuleList([
-            InverseModel(self.obs_dim, n_actions).to(device)
-            for _ in range(n_agents)
+            InverseModel(self.obs_dim, n_actions).to(device) for _ in range(n_agents)
         ])
-
-        self.fm_optimizers = [
-            optim.Adam(fm.parameters(), lr=lr)
-            for fm in self.forward_models
-        ]
-        self.im_optimizers = [
-            optim.Adam(im.parameters(), lr=lr)
-            for im in self.inverse_models
-        ]
+        self.fm_optimizers = [optim.Adam(fm.parameters(), lr=lr) for fm in self.forward_models]
+        self.im_optimizers = [optim.Adam(im.parameters(), lr=lr) for im in self.inverse_models]
 
     def ground_action(self, agent_id: int, obs: np.ndarray, intended_action: int) -> int:
         fm = self.forward_models[agent_id]
@@ -268,74 +377,43 @@ class PerAgentGAT:
             a_onehot = F.one_hot(
                 torch.tensor([intended_action]), num_classes=self.n_actions
             ).float().to(self.device)
-
-            # Forward model predicts where real dynamics would take us
             pred_real_next = fm(obs_t, a_onehot)
-
-            # Inverse model asks: which sim action leads to this next state?
-            logits   = im(obs_t, pred_real_next)
-            grounded = logits.argmax(dim=-1).item()
-        return grounded
+            logits         = im(obs_t, pred_real_next)
+            return logits.argmax(dim=-1).item()
 
     def train_forward_step(self, agent_id: int, batch):
         obs, actions, next_obs = batch
         fm  = self.forward_models[agent_id]
         opt = self.fm_optimizers[agent_id]
         fm.train()
-
         obs_t      = torch.FloatTensor(obs).to(self.device)
         a_onehot   = F.one_hot(
             torch.LongTensor(actions).to(self.device), num_classes=self.n_actions
         ).float()
         next_obs_t = torch.FloatTensor(next_obs).to(self.device)
-
-        pred_next = fm(obs_t, a_onehot)
-        loss = F.mse_loss(pred_next, next_obs_t)
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        loss = F.mse_loss(fm(obs_t, a_onehot), next_obs_t)
+        opt.zero_grad(); loss.backward(); opt.step()
         return loss.item()
 
     def train_inverse_step(self, agent_id: int, batch):
-        """
-        Train purely on sim (obs, action, next_obs) triples.
-        No forward model involvement — that only happens at inference.
-        """
         obs, actions, next_obs = batch
         im  = self.inverse_models[agent_id]
         opt = self.im_optimizers[agent_id]
         im.train()
-
         obs_t      = torch.FloatTensor(obs).to(self.device)
         next_obs_t = torch.FloatTensor(next_obs).to(self.device)
-
-        # Supervised on sim transitions: (obs, next_obs) → action
         logits = im(obs_t, next_obs_t)
         loss   = F.cross_entropy(logits, torch.LongTensor(actions).to(self.device))
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        opt.zero_grad(); loss.backward(); opt.step()
         return loss.item()
 
     def save(self, path: str):
-        state = {
-            f'forward_model_{i}': self.forward_models[i].state_dict()
-            for i in range(self.n_agents)
-        }
-        state.update({
-            f'inverse_model_{i}': self.inverse_models[i].state_dict()
-            for i in range(self.n_agents)
-        })
-        state.update({
-            f'fm_optimizer_{i}': self.fm_optimizers[i].state_dict()
-            for i in range(self.n_agents)
-        })
-        state.update({
-            f'im_optimizer_{i}': self.im_optimizers[i].state_dict()
-            for i in range(self.n_agents)
-        })
+        state = {}
+        for i in range(self.n_agents):
+            state[f'forward_model_{i}'] = self.forward_models[i].state_dict()
+            state[f'inverse_model_{i}'] = self.inverse_models[i].state_dict()
+            state[f'fm_optimizer_{i}']  = self.fm_optimizers[i].state_dict()
+            state[f'im_optimizer_{i}']  = self.im_optimizers[i].state_dict()
         torch.save(state, path)
         print(f"[PerAgentGAT] Saved to {path}")
 
@@ -349,6 +427,105 @@ class PerAgentGAT:
         print(f"[PerAgentGAT] Loaded from {path}")
 
 
+class PerAgentSGAT(PerAgentGAT):
+    """
+    Stochastic GAT — each agent has its own stochastic forward + inverse model.
+
+    Mirrors the relationship between SharedGAT → SharedSGAT:
+      - forward_models use StochasticForwardModel
+      - train_forward_step uses Gaussian NLL
+      - ground_action samples from the distribution
+    """
+
+    def __init__(self, obs_size: int, n_actions: int, n_agents: int,
+                 lr: float = 1e-3, device: str = 'cuda'):
+        super().__init__(obs_size, n_actions, n_agents, lr, device)
+
+        # Replace all deterministic FMs with stochastic ones
+        self.forward_models = nn.ModuleList([
+            StochasticForwardModel(self.obs_dim, n_actions).to(device)
+            for _ in range(n_agents)
+        ])
+        self.fm_optimizers = [
+            optim.Adam(fm.parameters(), lr=lr) for fm in self.forward_models
+        ]
+
+    def ground_action(self, agent_id: int, obs: np.ndarray, intended_action: int) -> int:
+        fm = self.forward_models[agent_id]
+        im = self.inverse_models[agent_id]
+        fm.eval(); im.eval()
+        with torch.no_grad():
+            obs_t    = torch.FloatTensor(obs.flatten()).unsqueeze(0).to(self.device)
+            a_onehot = F.one_hot(
+                torch.tensor([intended_action]), num_classes=self.n_actions
+            ).float().to(self.device)
+            # Sample from predicted distribution
+            sampled_next = fm.sample(obs_t, a_onehot)
+            logits       = im(obs_t, sampled_next)
+            return logits.argmax(dim=-1).item()
+
+    def train_forward_step(self, agent_id: int, batch):
+        obs, actions, next_obs = batch
+        fm  = self.forward_models[agent_id]
+        opt = self.fm_optimizers[agent_id]
+        fm.train()
+        obs_t      = torch.FloatTensor(obs).to(self.device)
+        a_onehot   = F.one_hot(
+            torch.LongTensor(actions).to(self.device), num_classes=self.n_actions
+        ).float()
+        next_obs_t = torch.FloatTensor(next_obs).to(self.device)
+        mean, log_std = fm(obs_t, a_onehot)
+        loss = gaussian_nll_loss(mean, log_std, next_obs_t)
+        opt.zero_grad(); loss.backward(); opt.step()
+        return loss.item()
+
+    def save(self, path: str):
+        state = {}
+        for i in range(self.n_agents):
+            state[f'forward_model_{i}'] = self.forward_models[i].state_dict()
+            state[f'inverse_model_{i}'] = self.inverse_models[i].state_dict()
+            state[f'fm_optimizer_{i}']  = self.fm_optimizers[i].state_dict()
+            state[f'im_optimizer_{i}']  = self.im_optimizers[i].state_dict()
+        torch.save(state, path)
+        print(f"[PerAgentSGAT] Saved to {path}")
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        for i in range(self.n_agents):
+            self.forward_models[i].load_state_dict(ckpt[f'forward_model_{i}'])
+            self.inverse_models[i].load_state_dict(ckpt[f'inverse_model_{i}'])
+            self.fm_optimizers[i].load_state_dict(ckpt[f'fm_optimizer_{i}'])
+            self.im_optimizers[i].load_state_dict(ckpt[f'im_optimizer_{i}'])
+        print(f"[PerAgentSGAT] Loaded from {path}")
+
+
+# ---------------------------------------------------------------------------
+# Factory helper
+# ---------------------------------------------------------------------------
+
+def build_gat(obs_size: int, n_actions: int, n_agents: int, variant: str,
+              stochastic: bool, lr: float, device: str):
+    """
+    Instantiate the correct GAT class based on variant and stochastic flag.
+
+    variant    stochastic    class
+    ──────────────────────────────
+    shared     False         SharedGAT
+    shared     True          SharedSGAT
+    per_agent  False         PerAgentGAT
+    per_agent  True          PerAgentSGAT
+    """
+    if variant == 'shared':
+        cls = SharedSGAT if stochastic else SharedGAT
+    else:
+        cls = PerAgentSGAT if stochastic else PerAgentGAT
+
+    label = ('S' if stochastic else '') + 'GAT'
+    print(f"[build_gat] Using {cls.__name__} ({label}, variant={variant})")
+    return cls(obs_size=obs_size, n_actions=n_actions, n_agents=n_agents,
+               lr=lr, device=device)
+
+
 # ---------------------------------------------------------------------------
 # Trajectory Collection
 # ---------------------------------------------------------------------------
@@ -357,7 +534,7 @@ class TransitionBuffer:
     """Lightweight buffer storing (obs, action, next_obs) triples for GAT training."""
 
     def __init__(self):
-        self._data = []   # list of (obs_flat, action, next_obs_flat)
+        self._data = []
 
     def push(self, obs_flat, action, next_obs_flat):
         self._data.append((obs_flat, action, next_obs_flat))
@@ -374,16 +551,15 @@ class TransitionBuffer:
 def collect_trajectories(
     env_config: dict,
     n_episodes: int,
-    obs_size: int,
-    policy: IndependentDQN | None = None,
-    epsilon: float = 1.0,
-    seed: int = 22,
-    label: str = "env",
+    obs_size:   int,
+    policy:     IndependentDQN | None = None,
+    epsilon:    float = 1.0,
+    seed:       int   = 22,
+    label:      str   = "env",
 ) -> list[TransitionBuffer]:
     """
-    Collect transition data from an environment.
-
-    Returns a list of n_agents TransitionBuffers, one per agent.
+    Collect (obs, action, next_obs) transitions from an environment.
+    Returns one TransitionBuffer per agent.
     """
     env      = ExplorerMALocalObs(conf=env_config)
     n_agents = env.n_agents
@@ -395,7 +571,6 @@ def collect_trajectories(
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=seed)
         done   = False
-        steps  = 0
 
         while not done:
             if policy is not None and random.random() > epsilon:
@@ -412,99 +587,128 @@ def collect_trajectories(
                     actions[i],
                     next_obs[i].flatten().astype(np.float32),
                 )
-
-            obs   = next_obs
-            steps += 1
+            obs = next_obs
 
         if (ep + 1) % max(1, n_episodes // 5) == 0:
-            total = sum(len(b) for b in buffers)
-            print(f"  Episode {ep+1}/{n_episodes} | total transitions={total}")
+            print(f"  Episode {ep+1}/{n_episodes} | "
+                  f"total transitions={sum(len(b) for b in buffers)}")
 
     env.close()
     return buffers
 
 
 # ---------------------------------------------------------------------------
-# GAT Training Loop
+# GAT / SGAT Model Training
 # ---------------------------------------------------------------------------
 
 def train_gat_models(
     gat,
-    real_buffers:  list[TransitionBuffer],
-    sim_buffers:   list[TransitionBuffer],
-    n_epochs:      int   = 50,
-    batch_size:    int   = 256,
-    shared:        bool  = True,
+    real_buffers: list[TransitionBuffer],
+    sim_buffers:  list[TransitionBuffer],
+    n_epochs:     int  = 50,
+    batch_size:   int  = 256,
+    shared:       bool = True,
 ) -> dict:
     """
-    Train forward models on real data and inverse models on sim data.
+    Train forward models on real data, inverse models on sim data.
 
-    Forward model: real (obs, action) → next_obs   [MSE loss]
-    Inverse model: sim  (obs, next_obs) → action    [cross-entropy loss]
+    GAT  — Forward: MSE loss          real (obs, action) → next_obs
+    SGAT — Forward: Gaussian NLL loss  real (obs, action) → dist over next_obs
+    Both — Inverse: cross-entropy      sim  (obs, next_obs) → action
+
+    The training loop is identical regardless of deterministic vs stochastic;
+    the loss difference is encapsulated inside gat.train_forward_step().
     """
     n_agents = len(real_buffers)
     history  = {'fm_losses': [], 'im_losses': []}
 
+    is_sgat = isinstance(gat, (SharedSGAT, PerAgentSGAT))
+    fm_desc = "Gaussian NLL (SGAT)" if is_sgat else "MSE (GAT)"
+
     print(f"\n{'='*60}")
-    print(f"Training GAT models  ({'shared' if shared else 'per-agent'})")
-    print(f"  Forward model  → {sum(len(b) for b in real_buffers)} real transitions")
-    print(f"  Inverse model  → {sum(len(b) for b in sim_buffers)} sim transitions")
+    print(f"Training {'SGAT' if is_sgat else 'GAT'} models "
+          f"({'shared' if shared else 'per-agent'})")
+    print(f"  Forward model loss → {fm_desc}")
+    print(f"  Forward data       → {sum(len(b) for b in real_buffers)} real transitions")
+    print(f"  Inverse data       → {sum(len(b) for b in sim_buffers)} sim transitions")
     print(f"  Epochs: {n_epochs} | Batch: {batch_size}")
     print(f"{'='*60}")
 
     for epoch in range(n_epochs):
-        epoch_fm = []
-        epoch_im = []
+        epoch_fm, epoch_im = [], []
 
         if shared:
-            all_real_obs, all_real_act, all_real_next = [], [], []
-            all_sim_obs,  all_sim_act,  all_sim_next  = [], [], []
-
+            real_obs, real_act, real_next = [], [], []
+            sim_obs,  sim_act,  sim_next  = [], [], []
             for i in range(n_agents):
                 ro, ra, rn = real_buffers[i].sample(batch_size // n_agents)
                 so, sa, sn = sim_buffers[i].sample(batch_size // n_agents)
-                all_real_obs.append(ro); all_real_act.append(ra); all_real_next.append(rn)
-                all_sim_obs.append(so);  all_sim_act.append(sa);  all_sim_next.append(sn)
+                real_obs.append(ro); real_act.append(ra); real_next.append(rn)
+                sim_obs.append(so);  sim_act.append(sa);  sim_next.append(sn)
 
-            real_batch = (
-                np.concatenate(all_real_obs),
-                np.concatenate(all_real_act),
-                np.concatenate(all_real_next),
-            )
-            sim_batch  = (
-                np.concatenate(all_sim_obs),
-                np.concatenate(all_sim_act),
-                np.concatenate(all_sim_next),
-            )
-
-            fm_loss = gat.train_forward_step(real_batch)
-            im_loss = gat.train_inverse_step(sim_batch)
-            epoch_fm.append(fm_loss)
-            epoch_im.append(im_loss)
-
+            fm_loss = gat.train_forward_step((
+                np.concatenate(real_obs), np.concatenate(real_act), np.concatenate(real_next)
+            ))
+            im_loss = gat.train_inverse_step((
+                np.concatenate(sim_obs), np.concatenate(sim_act), np.concatenate(sim_next)
+            ))
+            epoch_fm.append(fm_loss); epoch_im.append(im_loss)
         else:
             for i in range(n_agents):
-                real_batch = real_buffers[i].sample(batch_size)
-                sim_batch  = sim_buffers[i].sample(batch_size)
-                fm_loss    = gat.train_forward_step(i, real_batch)
-                im_loss    = gat.train_inverse_step(i, sim_batch)
-                epoch_fm.append(fm_loss)
-                epoch_im.append(im_loss)
+                epoch_fm.append(gat.train_forward_step(i, real_buffers[i].sample(batch_size)))
+                epoch_im.append(gat.train_inverse_step(i, sim_buffers[i].sample(batch_size)))
 
         history['fm_losses'].append(float(np.mean(epoch_fm)))
         history['im_losses'].append(float(np.mean(epoch_im)))
 
         if (epoch + 1) % max(1, n_epochs // 10) == 0:
             print(f"  Epoch {epoch+1:>4}/{n_epochs} | "
-                  f"FM loss: {history['fm_losses'][-1]:.5f} | "
+                  f"FM loss ({fm_desc}): {history['fm_losses'][-1]:.5f} | "
                   f"IM loss: {history['im_losses'][-1]:.5f}")
 
-    print("GAT training complete.\n")
+    print("GAT/SGAT model training complete.\n")
     return history
 
 
 # ---------------------------------------------------------------------------
-# Policy Fine-Tuning with GAT
+# Shared Evaluation Helper
+# ---------------------------------------------------------------------------
+
+def _eval_real(env_config, agent, obs_size, seed, device, n_episodes: int = 10):
+    """
+    Run n_episodes in the real (slip) environment with a greedy policy.
+    Returns (mean_coverage, mean_reward) averaged over all episodes.
+    Slip is stochastic so many episodes give a stable estimate.
+    """
+    all_coverages, all_rewards = [], []
+
+    for _ in range(n_episodes):
+        env      = ExplorerMALocalObs(conf=env_config)
+        n_agents = env.n_agents
+        obs, _   = env.reset(seed=seed)
+        ep_reward = [0.0] * n_agents
+        done      = False
+
+        while not done:
+            actions  = [agent.select_action(obs[j], eval_mode=True) for j in range(n_agents)]
+            next_obs, rewards, terminated, truncated, _ = env.step(actions)
+            done = terminated or truncated
+            for j in range(n_agents):
+                ep_reward[j] += rewards[j]
+            obs = next_obs
+
+        explored = np.count_nonzero(env.exploredMap)
+        total    = env.SIZE[0] * env.SIZE[1]
+        env.close()
+
+        all_coverages.append(explored / total)
+        all_rewards.append(float(np.mean(ep_reward)))
+
+    return float(np.mean(all_coverages)), float(np.mean(all_rewards))
+
+
+# ---------------------------------------------------------------------------
+# MODE 1: Finetune a pre-trained checkpoint with GAT / SGAT
 # ---------------------------------------------------------------------------
 
 def finetune_with_gat(
@@ -522,67 +726,68 @@ def finetune_with_gat(
     checkpoint_dir:  str   = 'checkpoints',
     device:          str   = 'cuda',
     seed:            int   = 22,
+    finetune_epsilon: float = 0.05,
 ) -> IndependentDQN:
     """
-    Fine-tune a pre-trained DQN policy in simulation using GAT-grounded actions.
+    Fine-tune a pre-trained DQN in SIM using GAT/SGAT-grounded actions.
 
-    Rollouts are collected in sim using grounded actions. Evaluation is performed
-    in the real environment (with slip) averaged over n_eval_episodes so the best
-    checkpoint reflects genuine sim-to-real transfer. Fine-tuning is fully greedy
-    (epsilon=0).
+    Args:
+        base_agent_path : Path to pre-trained IndependentDQN checkpoint
+        gat             : Trained SharedGAT/SharedSGAT or PerAgentGAT/PerAgentSGAT
+        env_config      : Sim environment config (for training rollouts)
+        env_config_real : Real environment config (for evaluation)
+        finetune_epsilon: Small exploration rate during finetuning (default 0.05)
     """
-    variant = 'shared' if shared else 'per_agent'
+    is_sgat   = isinstance(gat, (SharedSGAT, PerAgentSGAT))
+    algo_name = 'SGAT' if is_sgat else 'GAT'
+    variant   = 'shared' if shared else 'per_agent'
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join(checkpoint_dir, f'gat_{variant}_finetune_{timestamp}')
+    run_dir   = os.path.join(checkpoint_dir, f'{algo_name.lower()}_{variant}_finetune_{timestamp}')
     os.makedirs(run_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"Fine-tuning DQN with GAT  (variant={variant})")
-    print(f"  Base policy    : {base_agent_path}")
-    print(f"  Episodes       : {n_episodes}")
-    print(f"  Exploration    : greedy (epsilon=0)")
-    print(f"  Eval env       : real (slip_prob={env_config_real.get('slip_prob', '?')})")
-    print(f"  Eval episodes  : {n_eval_episodes} (averaged)")
-    print(f"  Run dir        : {run_dir}")
+    print(f"FINETUNE MODE — {algo_name} variant: {variant}")
+    print(f"  Base policy     : {base_agent_path}")
+    print(f"  Episodes        : {n_episodes}")
+    print(f"  Finetune epsilon: {finetune_epsilon}")
+    print(f"  Eval env        : real slip_prob={env_config_real.get('slip_prob')}")
+    print(f"  Best model by   : real-env COVERAGE (mean over {n_eval_episodes} eps)")
+    print(f"  Run dir         : {run_dir}")
     print(f"{'='*60}\n")
 
-    # Load base policy — fully greedy, no epsilon exploration
+    # Load base policy with small epsilon for stability
     agent = IndependentDQN(obs_size=obs_size, n_actions=4, device=device)
     agent.load(base_agent_path)
-    agent.epsilon       = 0.0
-    agent.epsilon_end   = 0.0
-    agent.epsilon_decay = 1.0
+    agent.epsilon       = finetune_epsilon
+    agent.epsilon_end   = finetune_epsilon
+    agent.epsilon_decay = 1.0   # Hold epsilon constant during finetuning
 
     env      = ExplorerMALocalObs(conf=env_config)
     n_agents = env.n_agents
 
-    ep_rewards, ep_coverages = [], []
-    losses = []
-    eval_rewards_hist, eval_coverages_hist, eval_ep_nums = [], [], []
-    best_eval_reward = -float('inf')
+    ep_rewards, ep_coverages, losses          = [], [], []
+    eval_coverages_hist, eval_rewards_hist    = [], []
+    eval_ep_nums                              = []
+    best_eval_coverage = -float('inf')
 
     for episode in range(n_episodes):
-        obs, _ = env.reset(seed=seed)
+        obs, _    = env.reset(seed=seed)
         ep_reward = [0.0] * n_agents
         done      = False
 
         while not done:
-            # 1. DQN selects intended actions (greedy)
             intended = [agent.select_action(obs[i]) for i in range(n_agents)]
 
-            # 2. GAT grounds each intended action via forward model → inverse model
             if shared:
                 grounded = [gat.ground_action(obs[i], intended[i]) for i in range(n_agents)]
             else:
                 grounded = [gat.ground_action(i, obs[i], intended[i]) for i in range(n_agents)]
 
-            # 3. Step sim with grounded actions
             next_obs, rewards, terminated, truncated, _ = env.step(grounded)
             done = terminated or truncated
 
-            # 4. Store transitions
             for i in range(n_agents):
-                agent.store_transition(obs[i], intended[i], rewards[i], next_obs[i], done)
+                agent.store_transition(obs[i], grounded[i], rewards[i], next_obs[i], done)
                 ep_reward[i] += rewards[i]
 
             loss = agent.train_step()
@@ -591,99 +796,203 @@ def finetune_with_gat(
 
             obs = next_obs
 
-        total_cells    = env.SIZE[0] * env.SIZE[1]
-        explored_cells = np.count_nonzero(env.exploredMap)
-        coverage       = explored_cells / total_cells
-
+        coverage = np.count_nonzero(env.exploredMap) / (env.SIZE[0] * env.SIZE[1])
         ep_rewards.append(float(np.mean(ep_reward)))
         ep_coverages.append(coverage)
 
-        # Deterministic evaluation averaged over n_eval_episodes in the REAL environment
         if (episode + 1) % eval_freq == 0:
-            eval_r, eval_c = _eval_episodes(
+            eval_cov, eval_rew = _eval_real(
                 env_config_real, agent, obs_size, seed, device, n_eval_episodes
             )
-            eval_rewards_hist.append(eval_r)
-            eval_coverages_hist.append(eval_c)
+            eval_coverages_hist.append(eval_cov)
+            eval_rewards_hist.append(eval_rew)
             eval_ep_nums.append(episode + 1)
 
             print(f"\n[EVAL/REAL] Episode {episode+1} | "
-                  f"Reward={eval_r:.2f} | Coverage={eval_c:.2%} "
-                  f"(avg over {n_eval_episodes} episodes)")
+                  f"Coverage={eval_cov:.2%} | Reward={eval_rew:.2f} "
+                  f"(mean over {n_eval_episodes} eps)")
 
-            if eval_r > best_eval_reward:
-                best_eval_reward = eval_r
-                best_path = os.path.join(run_dir, 'best_model.pt')
-                agent.save(best_path)
-                print(f"  *** New best real-env model saved: {eval_r:.2f} ***")
+            if eval_cov > best_eval_coverage:
+                best_eval_coverage = eval_cov
+                agent.save(os.path.join(run_dir, 'best_model.pt'))
+                print(f"  *** New best coverage: {eval_cov:.2%} — model saved ***")
 
         if (episode + 1) % log_freq == 0:
-            recent_r = np.mean(ep_rewards[-log_freq:])
-            recent_c = np.mean(ep_coverages[-log_freq:])
-            avg_loss = np.mean(losses[-200:]) if losses else 0.0
             print(f"EP {episode+1:>5}/{n_episodes} | "
-                  f"Reward={recent_r:.2f} | Coverage={recent_c:.2%} | "
-                  f"Loss={avg_loss:.4f}")
+                  f"SimReward={np.mean(ep_rewards[-log_freq:]):.2f} | "
+                  f"SimCov={np.mean(ep_coverages[-log_freq:]):.2%} | "
+                  f"Loss={np.mean(losses[-200:]) if losses else 0:.4f} | "
+                  f"ε={agent.epsilon:.3f}")
 
         if (episode + 1) % save_freq == 0:
-            ckpt_path = os.path.join(run_dir, f'checkpoint_ep{episode+1}.pt')
-            agent.save(ckpt_path)
+            agent.save(os.path.join(run_dir, f'checkpoint_ep{episode+1}.pt'))
 
     agent.save(os.path.join(run_dir, 'final_model.pt'))
+    np.save(os.path.join(run_dir, 'metrics.npy'), {
+        'ep_rewards': ep_rewards, 'ep_coverages': ep_coverages, 'losses': losses,
+        'eval_coverages': eval_coverages_hist, 'eval_rewards': eval_rewards_hist,
+        'eval_episodes': eval_ep_nums, 'best_eval_coverage': best_eval_coverage,
+        'mode': 'finetune', 'variant': variant, 'algo': algo_name,
+        'slip_prob': env_config_real.get('slip_prob'),
+    })
 
-    metrics = {
-        'ep_rewards':       ep_rewards,
-        'ep_coverages':     ep_coverages,
-        'losses':           losses,
-        'eval_rewards':     eval_rewards_hist,
-        'eval_coverages':   eval_coverages_hist,
-        'eval_episodes':    eval_ep_nums,
-        'best_eval_reward': best_eval_reward,
-        'variant':          variant,
-        'eval_env':         'real',
-        'slip_prob':        env_config_real.get('slip_prob'),
-        'n_eval_episodes':  n_eval_episodes,
-    }
-    np.save(os.path.join(run_dir, 'metrics.npy'), metrics)
-
-    print(f"\nFine-tuning done. Best real-env reward: {best_eval_reward:.2f}")
-    print(f"Run directory: {run_dir}")
+    print(f"\nFinetuning done. Best real-env coverage: {best_eval_coverage:.2%}")
     return agent
 
 
-def _eval_episodes(env_config, agent, obs_size, seed, device, n_episodes: int = 10):
-    """
-    Run n_episodes deterministic evaluation episodes and return averaged
-    (reward, coverage) over all episodes.
+# ---------------------------------------------------------------------------
+# MODE 2: Train IDQN from scratch inside the GAT / SGAT loop
+# ---------------------------------------------------------------------------
 
-    Each episode uses the same seed.
+def train_from_scratch_with_gat(
+    gat,
+    env_config:      dict,
+    env_config_real: dict,
+    obs_size:        int   = 7,
+    n_episodes:      int   = 2000,
+    shared:          bool  = True,
+    save_freq:       int   = 200,
+    log_freq:        int   = 20,
+    eval_freq:       int   = 20,
+    n_eval_episodes: int   = 20,
+    checkpoint_dir:  str   = 'checkpoints',
+    device:          str   = 'cuda',
+    seed:            int   = 22,
+    learning_rate:   float = 1e-4,
+    epsilon_start:   float = 1.0,
+    epsilon_end:     float = 0.05,
+    epsilon_decay:   float = 0.995,
+    buffer_capacity: int   = 100_000,
+    batch_size:      int   = 128,
+    target_update:   int   = 1000,
+    gamma:           float = 0.99,
+) -> IndependentDQN:
     """
-    all_rewards   = []
-    all_coverages = []
+    Train an IDQN policy FROM SCRATCH using GAT/SGAT-grounded actions throughout.
 
-    for i in range(n_episodes):
-        env      = ExplorerMALocalObs(conf=env_config)
-        n_agents = env.n_agents
-        obs, _   = env.reset(seed=seed)
+    For SGAT, the grounding is stochastic per call — the same intended action may
+    map to different grounded actions across steps, naturally allowing the
+    policy to handle stochastic transitions.
+
+    Args:
+        gat             : Trained SharedGAT/SGAT or PerAgentGAT/SGAT instance
+        env_config      : Sim environment config (training rollouts)
+        env_config_real : Real environment config (evaluation with slip)
+        n_episodes      : Training episodes (recommend 1000-3000)
+        n_eval_episodes : Real-env eval episodes to average (recommend 20-30)
+    """
+    is_sgat   = isinstance(gat, (SharedSGAT, PerAgentSGAT))
+    algo_name = 'SGAT' if is_sgat else 'GAT'
+    variant   = 'shared' if shared else 'per_agent'
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir   = os.path.join(checkpoint_dir, f'{algo_name.lower()}_{variant}_scratch_{timestamp}')
+    os.makedirs(run_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"FROM-SCRATCH MODE — {algo_name} variant: {variant}")
+    print(f"  Episodes        : {n_episodes}")
+    print(f"  Epsilon         : {epsilon_start} → {epsilon_end} (decay={epsilon_decay})")
+    print(f"  Eval env        : real slip_prob={env_config_real.get('slip_prob')}")
+    print(f"  Best model by   : real-env COVERAGE (mean over {n_eval_episodes} eps)")
+    print(f"  Run dir         : {run_dir}")
+    print(f"{'='*60}\n")
+
+    env      = ExplorerMALocalObs(conf=env_config)
+    n_agents = env.n_agents
+
+    agent = IndependentDQN(
+        obs_size=obs_size,
+        n_actions=4,
+        learning_rate=learning_rate,
+        gamma=gamma,
+        epsilon_start=epsilon_start,
+        epsilon_end=epsilon_end,
+        epsilon_decay=epsilon_decay,
+        buffer_capacity=buffer_capacity,
+        batch_size=batch_size,
+        target_update_freq=target_update,
+        device=device,
+    )
+
+    ep_rewards, ep_coverages, losses          = [], [], []
+    eval_coverages_hist, eval_rewards_hist    = [], []
+    eval_ep_nums                              = []
+    best_eval_coverage = -float('inf')
+
+    print(f"Training fresh IDQN with {algo_name} grounding ({n_agents} agents)...")
+    print("-" * 60)
+
+    for episode in range(n_episodes):
+        obs, _    = env.reset(seed=seed)
         ep_reward = [0.0] * n_agents
         done      = False
 
         while not done:
-            actions  = [agent.select_action(obs[j], eval_mode=True) for j in range(n_agents)]
-            next_obs, rewards, terminated, truncated, _ = env.step(actions)
+            intended = [agent.select_action(obs[i]) for i in range(n_agents)]
+
+            if shared:
+                grounded = [gat.ground_action(obs[i], intended[i]) for i in range(n_agents)]
+            else:
+                grounded = [gat.ground_action(i, obs[i], intended[i]) for i in range(n_agents)]
+
+            next_obs, rewards, terminated, truncated, _ = env.step(grounded)
             done = terminated or truncated
-            for j in range(n_agents):
-                ep_reward[j] += rewards[j]
+
+            for i in range(n_agents):
+                agent.store_transition(obs[i], grounded[i], rewards[i], next_obs[i], done)
+                ep_reward[i] += rewards[i]
+
+            loss = agent.train_step()
+            if loss is not None:
+                losses.append(loss)
+
             obs = next_obs
 
-        total_cells    = env.SIZE[0] * env.SIZE[1]
-        explored_cells = np.count_nonzero(env.exploredMap)
-        env.close()
+        agent.update_epsilon()
 
-        all_rewards.append(float(np.mean(ep_reward)))
-        all_coverages.append(explored_cells / total_cells)
+        coverage = np.count_nonzero(env.exploredMap) / (env.SIZE[0] * env.SIZE[1])
+        ep_rewards.append(float(np.mean(ep_reward)))
+        ep_coverages.append(coverage)
 
-    return float(np.mean(all_rewards)), float(np.mean(all_coverages))
+        if (episode + 1) % eval_freq == 0:
+            eval_cov, eval_rew = _eval_real(
+                env_config_real, agent, obs_size, seed, device, n_eval_episodes
+            )
+            eval_coverages_hist.append(eval_cov)
+            eval_rewards_hist.append(eval_rew)
+            eval_ep_nums.append(episode + 1)
+
+            print(f"\n[EVAL/REAL] Episode {episode+1} | "
+                  f"Coverage={eval_cov:.2%} | Reward={eval_rew:.2f} "
+                  f"(mean over {n_eval_episodes} eps)")
+
+            if eval_cov > best_eval_coverage:
+                best_eval_coverage = eval_cov
+                agent.save(os.path.join(run_dir, 'best_model.pt'))
+                print(f"  *** New best coverage: {eval_cov:.2%} — model saved ***")
+
+        if (episode + 1) % log_freq == 0:
+            print(f"EP {episode+1:>5}/{n_episodes} | "
+                  f"SimReward={np.mean(ep_rewards[-log_freq:]):.2f} | "
+                  f"SimCov={np.mean(ep_coverages[-log_freq:]):.2%} | "
+                  f"Loss={np.mean(losses[-200:]) if losses else 0:.4f} | "
+                  f"ε={agent.epsilon:.3f} | "
+                  f"Buffer={len(agent.replay_buffer)}")
+
+        if (episode + 1) % save_freq == 0:
+            agent.save(os.path.join(run_dir, f'checkpoint_ep{episode+1}.pt'))
+
+    agent.save(os.path.join(run_dir, 'final_model.pt'))
+    np.save(os.path.join(run_dir, 'metrics.npy'), {
+        'ep_rewards': ep_rewards, 'ep_coverages': ep_coverages, 'losses': losses,
+        'eval_coverages': eval_coverages_hist, 'eval_rewards': eval_rewards_hist,
+        'eval_episodes': eval_ep_nums, 'best_eval_coverage': best_eval_coverage,
+        'mode': 'scratch', 'variant': variant, 'algo': algo_name,
+        'slip_prob': env_config_real.get('slip_prob'),
+    })
+
+    print(f"\nFrom-scratch training done. Best real-env coverage: {best_eval_coverage:.2%}")
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -691,92 +1000,108 @@ def _eval_episodes(env_config, agent, obs_size, seed, device, n_episodes: int = 
 # ---------------------------------------------------------------------------
 
 def run_gat_pipeline(
-    base_agent_path:      str,
-    env_config_sim:       dict,
-    env_config_real:      dict,
-    variant:              str  = 'shared',
-    obs_size:             int  = 7,
-    n_agents:             int  = 2,
-    n_actions:            int  = 4,
-    collect_episodes_real: int = 200,
-    collect_episodes_sim:  int = 200,
-    gat_epochs:           int  = 100,
-    gat_batch_size:       int  = 256,
-    gat_lr:               float = 1e-3,
-    finetune_episodes:    int  = 500,
-    device:               str  = 'cuda',
-    checkpoint_dir:       str  = 'checkpoints',
-    seed:                 int  = 22,
-    save_freq:            int  = 100,
-    log_freq:             int  = 10,
-    eval_freq:            int  = 10,
-    n_eval_episodes:      int  = 10,
+    env_config_sim:        dict,
+    env_config_real:       dict,
+    variant:               str   = 'shared',
+    mode:                  str   = 'scratch',
+    stochastic:            bool  = False,
+    base_agent_path:       str   = None,
+    obs_size:              int   = 7,
+    n_agents:              int   = 2,
+    n_actions:             int   = 4,
+    collect_episodes_real: int   = 200,
+    collect_episodes_sim:  int   = 200,
+    gat_epochs:            int   = 100,
+    gat_batch_size:        int   = 256,
+    gat_lr:                float = 1e-3,
+    train_episodes:        int   = 2000,
+    n_eval_episodes:       int   = 20,
+    device:                str   = 'cuda',
+    checkpoint_dir:        str   = 'checkpoints',
+    seed:                  int   = 22,
+    save_freq:             int   = 200,
+    log_freq:              int   = 20,
+    eval_freq:             int   = 20,
+    finetune_epsilon:      float = 0.05,
 ):
     """
-    End-to-end GAT pipeline:
-      1. Load pre-trained base policy
-      2. Collect real-world trajectories  (used to train forward model)
-      3. Collect simulation trajectories  (used to train inverse model)
-      4. Train GAT (forward + inverse) models
-      5. Fine-tune DQN policy in sim using GAT-grounded actions,
-         evaluated against the real environment (averaged over n_eval_episodes)
-    """
-    shared = (variant == 'shared')
-    assert variant in ('shared', 'per_agent'), "variant must be 'shared' or 'per_agent'"
+    End-to-end MA-GAT / MA-SGAT pipeline.
 
+    stochastic=False → deterministic GAT (original)
+    stochastic=True  → SGAT: forward model is a Gaussian, ground_action samples
+                       from it, capturing real-world transition stochasticity.
+
+    Steps:
+      1. [scratch] No base policy needed  /  [finetune] Load base policy
+      2. Collect real trajectories        → train forward model
+      3. Collect sim trajectories         → train inverse model
+      4. Build and train GAT/SGAT models
+      5. Train/finetune IDQN with grounded actions, eval against real env
+    """
+    assert variant in ('shared', 'per_agent'), "variant must be 'shared' or 'per_agent'"
+    assert mode in ('scratch', 'finetune'),    "mode must be 'scratch' or 'finetune'"
+    if mode == 'finetune':
+        assert base_agent_path is not None, "finetune mode requires --base_model"
+
+    algo_name = 'SGAT' if stochastic else 'GAT'
+    shared    = (variant == 'shared')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_root  = os.path.join(checkpoint_dir, f'gat_{variant}_{timestamp}')
+    run_root  = os.path.join(checkpoint_dir,
+                             f'{algo_name.lower()}_{variant}_{mode}_{timestamp}')
     os.makedirs(run_root, exist_ok=True)
 
     print("\n" + "=" * 70)
-    print(f"  MA-GAT PIPELINE  |  variant={variant}")
+    print(f"  MA-{algo_name} PIPELINE  |  variant={variant}  |  mode={mode}")
     print("=" * 70)
 
-    # ------------------------------------------------------------------ #
-    # Step 1 – Load base policy for guided collection                      #
-    # ------------------------------------------------------------------ #
-    print("\n[Step 1] Loading base policy for trajectory collection …")
-    base_agent = IndependentDQN(obs_size=obs_size, n_actions=n_actions, device=device)
-    base_agent.load(base_agent_path)
+    # ── Step 1 ─────────────────────────────────────────────────────────────
+    if mode == 'finetune':
+        print("\n[Step 1] Loading base policy for trajectory collection ...")
+        collection_policy = IndependentDQN(obs_size=obs_size, n_actions=n_actions, device=device)
+        collection_policy.load(base_agent_path)
+        collection_epsilon = 0.3
+    else:
+        print("\n[Step 1] Scratch mode — collecting with random policy ...")
+        collection_policy  = None
+        collection_epsilon = 1.0
 
-    # ------------------------------------------------------------------ #
-    # Step 2 – Collect real-world trajectories                             #
-    # ------------------------------------------------------------------ #
-    print("\n[Step 2] Collecting real-world trajectories …")
+    # ── Step 2: Real trajectories (forward model training data) ────────────
+    print("\n[Step 2] Collecting real-world trajectories ...")
     real_buffers = collect_trajectories(
         env_config=env_config_real,
         n_episodes=collect_episodes_real,
         obs_size=obs_size,
-        policy=base_agent,
-        epsilon=0.3,
+        policy=collection_policy,
+        epsilon=collection_epsilon,
         seed=seed,
         label="REAL",
     )
     print(f"  Real buffer sizes: {[len(b) for b in real_buffers]}")
 
-    # ------------------------------------------------------------------ #
-    # Step 3 – Collect simulation trajectories                             #
-    # ------------------------------------------------------------------ #
-    print("\n[Step 3] Collecting simulation trajectories …")
+    # ── Step 3: Sim trajectories (inverse model training data) ─────────────
+    print("\n[Step 3] Collecting simulation trajectories ...")
     sim_buffers = collect_trajectories(
         env_config=env_config_sim,
         n_episodes=collect_episodes_sim,
         obs_size=obs_size,
-        policy=base_agent,
-        epsilon=0.3,
+        policy=collection_policy,
+        epsilon=collection_epsilon,
         seed=seed,
         label="SIM",
     )
     print(f"  Sim buffer sizes: {[len(b) for b in sim_buffers]}")
 
-    # ------------------------------------------------------------------ #
-    # Step 4 – Build and train GAT models                                  #
-    # ------------------------------------------------------------------ #
-    print("\n[Step 4] Building and training GAT models …")
-    if shared:
-        gat = SharedGAT(obs_size, n_actions, n_agents, lr=gat_lr, device=device)
-    else:
-        gat = PerAgentGAT(obs_size, n_actions, n_agents, lr=gat_lr, device=device)
+    # ── Step 4: Build and train GAT/SGAT models ────────────────────────────
+    print(f"\n[Step 4] Building and training {algo_name} models ...")
+    gat = build_gat(
+        obs_size=obs_size,
+        n_actions=n_actions,
+        n_agents=n_agents,
+        variant=variant,
+        stochastic=stochastic,
+        lr=gat_lr,
+        device=device,
+    )
 
     gat_history = train_gat_models(
         gat=gat,
@@ -786,40 +1111,55 @@ def run_gat_pipeline(
         batch_size=gat_batch_size,
         shared=shared,
     )
-
-    gat_save_path = os.path.join(run_root, 'gat_models.pt')
-    gat.save(gat_save_path)
-
-    with open(os.path.join(run_root, 'gat_training_history.json'), 'w') as f:
+    gat.save(os.path.join(run_root, f'{algo_name.lower()}_models.pt'))
+    with open(os.path.join(run_root, f'{algo_name.lower()}_training_history.json'), 'w') as f:
         json.dump(gat_history, f, indent=2)
 
-    # ------------------------------------------------------------------ #
-    # Step 5 – Fine-tune DQN policy in sim with GAT                        #
-    # ------------------------------------------------------------------ #
-    print("\n[Step 5] Fine-tuning DQN policy with GAT …")
-    finetuned_agent = finetune_with_gat(
-        base_agent_path=base_agent_path,
-        gat=gat,
-        env_config=env_config_sim,
-        env_config_real=env_config_real,
-        obs_size=obs_size,
-        n_episodes=finetune_episodes,
-        shared=shared,
-        save_freq=save_freq,
-        log_freq=log_freq,
-        eval_freq=eval_freq,
-        n_eval_episodes=n_eval_episodes,
-        checkpoint_dir=run_root,
-        device=device,
-        seed=seed,
-    )
+    # ── Step 5: Train/finetune IDQN with GAT/SGAT ─────────────────────────
+    print(f"\n[Step 5] {'Finetuning' if mode == 'finetune' else 'Training from scratch'} "
+          f"IDQN with {algo_name} ...")
+
+    if mode == 'finetune':
+        agent = finetune_with_gat(
+            base_agent_path=base_agent_path,
+            gat=gat,
+            env_config=env_config_sim,
+            env_config_real=env_config_real,
+            obs_size=obs_size,
+            n_episodes=train_episodes,
+            shared=shared,
+            save_freq=save_freq,
+            log_freq=log_freq,
+            eval_freq=eval_freq,
+            n_eval_episodes=n_eval_episodes,
+            checkpoint_dir=run_root,
+            device=device,
+            seed=seed,
+            finetune_epsilon=finetune_epsilon,
+        )
+    else:
+        agent = train_from_scratch_with_gat(
+            gat=gat,
+            env_config=env_config_sim,
+            env_config_real=env_config_real,
+            obs_size=obs_size,
+            n_episodes=train_episodes,
+            shared=shared,
+            save_freq=save_freq,
+            log_freq=log_freq,
+            eval_freq=eval_freq,
+            n_eval_episodes=n_eval_episodes,
+            checkpoint_dir=run_root,
+            device=device,
+            seed=seed,
+        )
 
     print("\n" + "=" * 70)
-    print(f"  MA-GAT PIPELINE COMPLETE  |  variant={variant}")
+    print(f"  MA-{algo_name} PIPELINE COMPLETE  |  variant={variant}  |  mode={mode}")
     print(f"  All outputs saved to: {run_root}")
     print("=" * 70)
 
-    return finetuned_agent, gat
+    return agent, gat
 
 
 # ---------------------------------------------------------------------------
@@ -828,40 +1168,70 @@ def run_gat_pipeline(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Multi-Agent Grounded Action Transformation (MA-GAT)'
+        description='Multi-Agent Grounded Action Transformation (MA-GAT / MA-SGAT)'
     )
-    parser.add_argument('--base_model', type=str, required=True,
-                        help='Path to pre-trained IndependentDQN checkpoint')
+
+    # ── Mode and variant ───────────────────────────────────────────────────
+    parser.add_argument('--mode', type=str, default='scratch',
+                        choices=['scratch', 'finetune'],
+                        help='scratch: train IDQN from scratch (recommended)\n'
+                             'finetune: load checkpoint and finetune')
     parser.add_argument('--variant', type=str, default='shared',
                         choices=['shared', 'per_agent'],
-                        help='GAT variant: shared (parameter sharing) or per_agent')
-    parser.add_argument('--slip_prob', type=float, default=0.3,
-                        help='Slip probability for real environment (default: 0.3)')
+                        help='shared: parameter sharing across agents\n'
+                             'per_agent: independent models per agent')
+    parser.add_argument('--sgat', action='store_true', default=False,
+                        help='Use Stochastic GAT (SGAT): the forward model outputs '
+                             'a Gaussian distribution and samples from it during '
+                             'grounding, capturing real-world stochasticity. '
+                             'Recommended when slip_prob > 0.1.')
+    parser.add_argument('--base_model', type=str, default=None,
+                        help='Path to pre-trained IDQN checkpoint (required for finetune mode)')
+
+    # ── Environment ────────────────────────────────────────────────────────
+    parser.add_argument('--slip_prob', type=float, default=0.2,
+                        help='Slip probability for real environment (default: 0.2)')
+    parser.add_argument('--seed', type=int, default=22,
+                        help='Map seed (default: 22)')
+
+    # ── Data collection ────────────────────────────────────────────────────
     parser.add_argument('--collect_real', type=int, default=200,
                         help='Real-world collection episodes (default: 200)')
     parser.add_argument('--collect_sim', type=int, default=200,
                         help='Simulation collection episodes (default: 200)')
+
+    # ── GAT/SGAT training ─────────────────────────────────────────────────
     parser.add_argument('--gat_epochs', type=int, default=100,
-                        help='GAT training epochs (default: 100)')
+                        help='GAT/SGAT training epochs (default: 100)')
     parser.add_argument('--gat_lr', type=float, default=1e-3,
-                        help='GAT learning rate (default: 1e-3)')
-    parser.add_argument('--finetune_episodes', type=int, default=500,
-                        help='DQN fine-tuning episodes (default: 500)')
-    parser.add_argument('--n_eval_episodes', type=int, default=10,
-                        help='Real-env eval episodes to average over (default: 10)')
+                        help='GAT/SGAT learning rate (default: 1e-3)')
+
+    # ── IDQN training ─────────────────────────────────────────────────────
+    parser.add_argument('--train_episodes', type=int, default=2000,
+                        help='IDQN training episodes (default: 2000)')
+    parser.add_argument('--n_eval_episodes', type=int, default=20,
+                        help='Real-env eval episodes to average (default: 20)')
+    parser.add_argument('--finetune_epsilon', type=float, default=0.05,
+                        help='Epsilon for finetune mode (default: 0.05)')
+
+    # ── Logistics ─────────────────────────────────────────────────────────
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu'])
-    parser.add_argument('--seed', type=int, default=22,
-                        help='Environment / map seed (default: 22)')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
-                        help='Root checkpoint directory (default: checkpoints)')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
+    parser.add_argument('--save_freq', type=int, default=200)
+    parser.add_argument('--log_freq', type=int, default=20)
+    parser.add_argument('--eval_freq', type=int, default=20)
+
     args = parser.parse_args()
 
-    # ── Environment configuration ─────────────────────────────────────────
+    if args.mode == 'finetune' and args.base_model is None:
+        parser.error("--mode finetune requires --base_model <path>")
+
+    # ── Environment configuration ──────────────────────────────────────────
     conf["n_agents"]             = 2
     conf["shared_map"]           = True
-    conf["size"]                 = [30, 30]
-    conf["obstacles"]            = 10
+    conf["size"]                 = [15, 15]
+    conf["obstacles"]            = 0
     conf["lidar_range"]          = 2
     conf["obstacle_size"]        = [1, 3]
     conf["initial"]              = [1, 1]
@@ -871,21 +1241,25 @@ if __name__ == '__main__':
     conf["max_steps"]            = 200
     conf["verbose_slip"]         = False
 
-    env_config_sim = conf.copy()
+    env_config_sim              = conf.copy()
     env_config_sim['env_mode']  = 'sim'
     env_config_sim['slip_prob'] = 0.0
 
-    env_config_real = conf.copy()
+    env_config_real              = conf.copy()
     env_config_real['env_mode']  = 'real'
     env_config_real['slip_prob'] = args.slip_prob
 
-    device = args.device if torch.cuda.is_available() or args.device == 'cpu' else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() and args.device == 'cuda' else 'cpu'
+    algo   = 'SGAT' if args.sgat else 'GAT'
+    print(f"Using device: {device}  |  Algorithm: {algo}")
 
     run_gat_pipeline(
-        base_agent_path=args.base_model,
         env_config_sim=env_config_sim,
         env_config_real=env_config_real,
         variant=args.variant,
+        mode=args.mode,
+        stochastic=args.sgat,
+        base_agent_path=args.base_model,
         obs_size=7,
         n_agents=conf["n_agents"],
         n_actions=4,
@@ -893,9 +1267,13 @@ if __name__ == '__main__':
         collect_episodes_sim=args.collect_sim,
         gat_epochs=args.gat_epochs,
         gat_lr=args.gat_lr,
-        finetune_episodes=args.finetune_episodes,
+        train_episodes=args.train_episodes,
         n_eval_episodes=args.n_eval_episodes,
         device=device,
         checkpoint_dir=args.checkpoint_dir,
         seed=args.seed,
+        save_freq=args.save_freq,
+        log_freq=args.log_freq,
+        eval_freq=args.eval_freq,
+        finetune_epsilon=args.finetune_epsilon,
     )

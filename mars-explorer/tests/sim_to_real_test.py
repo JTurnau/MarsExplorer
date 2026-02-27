@@ -505,7 +505,7 @@ if __name__ == '__main__':
     conf["n_agents"] = 2
     conf["shared_map"] = True
     conf["size"] = [15, 15]
-    conf["obstacles"] = 10
+    conf["obstacles"] = 0
     conf["lidar_range"] = 2
     conf["obstacle_size"] = [1, 3]
     conf["initial"] = [1, 1]

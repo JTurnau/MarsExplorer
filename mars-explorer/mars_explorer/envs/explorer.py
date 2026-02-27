@@ -318,11 +318,11 @@ class ExplorerMALocalObs(gym.Env):
         explored_cells = np.count_nonzero(self.exploredMap)
         coverage = explored_cells / total_cells
 
-        if (not self.exploration_done) and coverage >= self.conf.get("explore_threshold", 0.90):
+        if (not self.exploration_done) and coverage >= self.conf.get("explore_threshold", 1.0):
             self.exploration_done = True
             # Bonus reward for completing exploration
             for i in range(self.n_agents):
-                self.rewards[i] += self.conf.get("explore_bonus", 500)
+                self.rewards[i] += self.conf.get("explore_bonus", 20)
             terminated = True
 
         # Max steps termination (truncation, not termination)
