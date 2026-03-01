@@ -44,17 +44,12 @@ from train_idqn import DQN_CNN, IndependentDQN, ReplayBuffer
 # Observation encoding helpers
 # ---------------------------------------------------------------------------
 
-# The four discrete float values the environment produces, in category order.
-# Category index = position in this list.
 OBS_CATEGORIES    = [0.0, 0.33, 0.66, 1.0]
 N_OBS_CATEGORIES  = len(OBS_CATEGORIES)  # 4
 
-# Precomputed tensor for fast float→category and category→float conversion.
-# Registered once; moved to device on first use via _get_category_tensor().
 _CAT_TENSOR_CACHE: dict = {}
 
 def _get_category_tensor(device: str) -> torch.Tensor:
-    """Return a (4,) float tensor of OBS_CATEGORIES on the requested device."""
     if device not in _CAT_TENSOR_CACHE:
         _CAT_TENSOR_CACHE[device] = torch.tensor(
             OBS_CATEGORIES, dtype=torch.float32, device=device
@@ -63,34 +58,12 @@ def _get_category_tensor(device: str) -> torch.Tensor:
 
 
 def obs_to_categories(obs_flat: torch.Tensor) -> torch.LongTensor:
-    """
-    Convert a float observation tensor to integer category indices.
-
-    Maps  0.00 → 0,  0.33 → 1,  0.66 → 2,  1.00 → 3  by finding the
-    nearest value in OBS_CATEGORIES.  Robust to small floating-point drift.
-
-    Args:
-        obs_flat: (batch, obs_dim) float tensor
-
-    Returns:
-        (batch, obs_dim) LongTensor of category indices in {0,1,2,3}
-    """
     cat = _get_category_tensor(str(obs_flat.device))
-    # Broadcast: (batch, obs_dim, 1) vs (4,) → distances (batch, obs_dim, 4)
     dists = (obs_flat.unsqueeze(-1) - cat).abs()
-    return dists.argmin(dim=-1)  # (batch, obs_dim)
+    return dists.argmin(dim=-1)
 
 
 def categories_to_obs(cat_indices: torch.Tensor) -> torch.Tensor:
-    """
-    Convert integer category indices back to float observation values.
-
-    Args:
-        cat_indices: (batch, obs_dim) LongTensor
-
-    Returns:
-        (batch, obs_dim) float tensor with values in {0.0, 0.33, 0.66, 1.0}
-    """
     cat = _get_category_tensor(str(cat_indices.device))
     return cat[cat_indices]
 
@@ -100,15 +73,6 @@ def categories_to_obs(cat_indices: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class ForwardModel(nn.Module):
-    """
-    Deterministic forward model. Predicts next observation under real dynamics.
-
-    Input:  flat(obs_t) || one_hot(action_t)    dim = obs_dim + n_actions
-    Output: flat(obs_{t+1})                      dim = obs_dim
-
-    Trained with MSE loss on real-world trajectories.
-    """
-
     def __init__(self, obs_dim: int, n_actions: int, hidden_dim: int = 256):
         super().__init__()
         self.obs_dim   = obs_dim
@@ -126,26 +90,6 @@ class ForwardModel(nn.Module):
 
 
 class StochasticForwardModel(nn.Module):
-    """
-    Categorical forward model for SGAT.
-
-    The observation space is discrete: each of the obs_dim cells takes exactly
-    one of 4 values {0.0, 0.33, 0.66, 1.0}.
-
-    Architecture:
-      - Shared trunk encodes (obs_t, action_t)
-      - Single logit head outputs obs_dim * N_OBS_CATEGORIES values,
-        reshaped to (batch, obs_dim, N_OBS_CATEGORIES)
-      - Loss: cross-entropy per cell (= NLL under categorical distribution)
-        averaged over cells and batch — this is -log p(s_{t+1} | s_t, a_t)
-        as specified in the SGAT paper, instantiated for categorical p.
-      - Sampling: torch.multinomial over per-cell softmax probabilities
-
-    Input:  flat(obs_t) || one_hot(action_t)      dim = obs_dim + n_actions
-    Output (forward):  logits  (batch, obs_dim, N_OBS_CATEGORIES)
-    Output (sample):   float obs  (1, obs_dim)  — values in {0.0,0.33,0.66,1.0}
-    """
-
     def __init__(self, obs_dim: int, n_actions: int,
                  n_categories: int = N_OBS_CATEGORIES, hidden_dim: int = 256):
         super().__init__()
@@ -159,57 +103,25 @@ class StochasticForwardModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        # One logit per category per observation cell
         self.logit_head = nn.Linear(hidden_dim, obs_dim * n_categories)
 
     def forward(self, obs: torch.Tensor,
                 action_onehot: torch.Tensor) -> torch.Tensor:
-        """
-        Returns logits of shape (batch, obs_dim, n_categories).
-        No softmax applied here — cross_entropy expects raw logits.
-        """
         h      = self.trunk(torch.cat([obs, action_onehot], dim=-1))
         logits = self.logit_head(h)
         return logits.view(-1, self.obs_dim, self.n_categories)
 
     def sample(self, obs: torch.Tensor,
                action_onehot: torch.Tensor) -> torch.Tensor:
-        """
-        Sample a next observation from the predicted categorical distributions.
-
-        For each of the obs_dim cells independently:
-          1. Compute softmax over the 4 category logits → probabilities
-          2. Sample one category index via multinomial sampling
-          3. Convert category index back to the float value the env uses
-
-        Returns:
-            (1, obs_dim) float tensor with values in {0.0, 0.33, 0.66, 1.0}
-        """
-        logits = self.forward(obs, action_onehot)          # (1, obs_dim, n_cat)
-        probs  = torch.softmax(logits, dim=-1)              # (1, obs_dim, n_cat)
-
-        # multinomial needs 2D input: (obs_dim, n_categories)
-        probs_2d     = probs.view(-1, self.n_categories)    # (obs_dim, n_cat)
+        logits = self.forward(obs, action_onehot)
+        probs  = torch.softmax(logits, dim=-1)
+        probs_2d     = probs.view(-1, self.n_categories)
         sampled_cats = torch.multinomial(probs_2d, num_samples=1).squeeze(-1)
-        # sampled_cats: (obs_dim,) — integer category indices
-
-        # Convert indices back to float observation values
-        sampled_obs = categories_to_obs(sampled_cats)       # (obs_dim,)
-        return sampled_obs.unsqueeze(0)                     # (1, obs_dim)
+        sampled_obs = categories_to_obs(sampled_cats)
+        return sampled_obs.unsqueeze(0)
 
 
 class InverseModel(nn.Module):
-    """
-    Maps (obs_t, predicted_real_next_obs) → grounded sim action.
-
-    Input:  flat(obs_t) || flat(obs_{t+1})    dim = 2 * obs_dim
-    Output: logits over actions                dim = n_actions
-
-    Trained on SIM (obs, action, next_obs) triples using cross-entropy.
-    At inference, next_obs is replaced by the forward model's real-dynamics
-    prediction (deterministic GAT) or categorical sample (SGAT).
-    """
-
     def __init__(self, obs_dim: int, n_actions: int, hidden_dim: int = 256):
         super().__init__()
         self.obs_dim   = obs_dim
@@ -232,28 +144,10 @@ class InverseModel(nn.Module):
 
 def categorical_nll_loss(logits: torch.Tensor,
                          target_obs: torch.Tensor) -> torch.Tensor:
-    """
-    NLL loss for the categorical forward model: -log p(s_{t+1} | s_t, a_t).
-
-    This is cross-entropy applied independently to each observation cell,
-    then averaged over cells and batch.
-
-    Args:
-        logits:     (batch, obs_dim, n_categories) — raw logits from forward model
-        target_obs: (batch, obs_dim) float tensor  — raw env obs values
-
-    Returns:
-        Scalar mean loss.
-    """
     batch, obs_dim, n_cat = logits.shape
-
-    # Convert float obs values to integer category indices for cross_entropy
-    target_cats = obs_to_categories(target_obs)             # (batch, obs_dim)
-
-    # F.cross_entropy expects (N, C) logits and (N,) targets
+    target_cats = obs_to_categories(target_obs)
     logits_flat  = logits.view(batch * obs_dim, n_cat)
     targets_flat = target_cats.view(batch * obs_dim)
-
     return F.cross_entropy(logits_flat, targets_flat)
 
 
@@ -262,10 +156,6 @@ def categorical_nll_loss(logits: torch.Tensor,
 # ---------------------------------------------------------------------------
 
 class SharedGAT:
-    """
-    Deterministic GAT — single forward + inverse model shared across all agents.
-    """
-
     def __init__(self, obs_size: int, n_actions: int, n_agents: int,
                  lr: float = 1e-3, device: str = 'cuda'):
         self.obs_size  = obs_size
@@ -292,7 +182,6 @@ class SharedGAT:
             return logits.argmax(dim=-1).item()
 
     def train_forward_step(self, batch):
-        """MSE on real transitions: (obs, action) → next_obs."""
         self.forward_model.train()
         obs, actions, next_obs = batch
         obs_t      = torch.FloatTensor(obs).to(self.device)
@@ -305,7 +194,6 @@ class SharedGAT:
         return loss.item()
 
     def train_inverse_step(self, batch):
-        """Cross-entropy on sim transitions: (obs, next_obs) → action."""
         self.inverse_model.train()
         obs, actions, next_obs = batch
         obs_t      = torch.FloatTensor(obs).to(self.device)
@@ -334,40 +222,15 @@ class SharedGAT:
 
 
 class SharedSGAT(SharedGAT):
-    """
-    Stochastic GAT — categorical forward model + inverse model, shared across agents.
-
-    Changes from SharedGAT:
-      1. forward_model is StochasticForwardModel (outputs per-cell categoricals)
-      2. train_forward_step uses categorical NLL = -log p(s'|s,a) per cell
-      3. ground_action samples from the categorical distribution per cell
-
-    The categorical model is correct for this environment because observations
-    are always one of exactly 4 float values {0.0, 0.33, 0.66, 1.0}.
-    The Gaussian model was wrong: it has no way to exploit variance to reduce
-    its loss because the correct next-state categories are unambiguous in the
-    training data, forcing the model to learn the true distribution.
-    """
-
     def __init__(self, obs_size: int, n_actions: int, n_agents: int,
                  lr: float = 1e-3, device: str = 'cuda'):
         super().__init__(obs_size, n_actions, n_agents, lr, device)
-
-        # Replace deterministic FM with categorical stochastic FM
         self.forward_model = StochasticForwardModel(
             self.obs_dim, n_actions, n_categories=N_OBS_CATEGORIES
         ).to(device)
         self.fm_optimizer = optim.Adam(self.forward_model.parameters(), lr=lr)
 
     def ground_action(self, obs: np.ndarray, intended_action: int) -> int:
-        """
-        Sample next obs from categorical distribution → inverse model → grounded action.
-
-        The sample varies each call (multinomial sampling), so the grounded
-        action is stochastic: the same (obs, intended_action) pair may produce
-        different grounded actions on different steps, directly reflecting the
-        probability distribution of real-world transitions.
-        """
         self.forward_model.eval()
         self.inverse_model.eval()
         with torch.no_grad():
@@ -375,19 +238,11 @@ class SharedSGAT(SharedGAT):
             a_onehot = F.one_hot(
                 torch.tensor([intended_action]), num_classes=self.n_actions
             ).float().to(self.device)
-            # Sample from categorical distribution — returns (1, obs_dim) float tensor
             sampled_next = self.forward_model.sample(obs_t, a_onehot)
             logits       = self.inverse_model(obs_t, sampled_next)
             return logits.argmax(dim=-1).item()
 
     def train_forward_step(self, batch):
-        """
-        Categorical NLL on real transitions: (obs, action) → distribution over next_obs.
-
-        Loss = -log p(s_{t+1} | s_t, a_t) under a per-cell categorical distribution.
-        This is cross-entropy between the predicted category probabilities and the
-        true category of each cell in the observed next state.
-        """
         self.forward_model.train()
         obs, actions, next_obs = batch
         obs_t      = torch.FloatTensor(obs).to(self.device)
@@ -395,8 +250,7 @@ class SharedSGAT(SharedGAT):
             torch.LongTensor(actions).to(self.device), num_classes=self.n_actions
         ).float()
         next_obs_t = torch.FloatTensor(next_obs).to(self.device)
-
-        logits = self.forward_model(obs_t, a_onehot)       # (batch, obs_dim, 4)
+        logits = self.forward_model(obs_t, a_onehot)
         loss   = categorical_nll_loss(logits, next_obs_t)
         self.fm_optimizer.zero_grad(); loss.backward(); self.fm_optimizer.step()
         return loss.item()
@@ -503,9 +357,7 @@ class PerAgentGAT:
 
 
 class PerAgentSGAT(PerAgentGAT):
-    """
-    Stochastic GAT — each agent has its own categorical forward + inverse model.
-    """
+    """Stochastic GAT — each agent has its own categorical forward + inverse model."""
 
     def __init__(self, obs_size: int, n_actions: int, n_agents: int,
                  lr: float = 1e-3, device: str = 'cuda'):
@@ -575,16 +427,6 @@ class PerAgentSGAT(PerAgentGAT):
 
 def build_gat(obs_size: int, n_actions: int, n_agents: int, variant: str,
               stochastic: bool, lr: float, device: str):
-    """
-    Instantiate the correct GAT class based on variant and stochastic flag.
-
-    variant    stochastic    class
-    ──────────────────────────────
-    shared     False         SharedGAT
-    shared     True          SharedSGAT
-    per_agent  False         PerAgentGAT
-    per_agent  True          PerAgentSGAT
-    """
     if variant == 'shared':
         cls = SharedSGAT if stochastic else SharedGAT
     else:
@@ -627,10 +469,6 @@ def collect_trajectories(
     seed:       int   = 22,
     label:      str   = "env",
 ) -> list[TransitionBuffer]:
-    """
-    Collect (obs, action, next_obs) transitions from an environment.
-    Returns one TransitionBuffer per agent.
-    """
     env      = ExplorerMALocalObs(conf=env_config)
     n_agents = env.n_agents
     buffers  = [TransitionBuffer() for _ in range(n_agents)]
@@ -682,9 +520,11 @@ def train_gat_models(
     """
     Train forward models on real data, inverse models on sim data.
 
-    GAT  — Forward: MSE loss                real (obs, action) → next_obs
-    SGAT — Forward: Categorical NLL loss     real (obs, action) → dist over next_obs
-    Both — Inverse: cross-entropy            sim  (obs, next_obs) → action
+    Per-agent variant:
+      - Agent i's forward model is trained ONLY on real_buffers[i]
+      - Agent i's inverse model is trained ONLY on sim_buffers[i]
+      - Models never see each other's data
+      - Per-agent losses are logged separately for verification
     """
     n_agents = len(real_buffers)
     history  = {'fm_losses': [], 'im_losses': []}
@@ -696,10 +536,19 @@ def train_gat_models(
     print(f"Training {'SGAT' if is_sgat else 'GAT'} models "
           f"({'shared' if shared else 'per-agent'})")
     print(f"  Forward model loss → {fm_desc}")
-    print(f"  Forward data       → {sum(len(b) for b in real_buffers)} real transitions")
-    print(f"  Inverse data       → {sum(len(b) for b in sim_buffers)} sim transitions")
+    if shared:
+        print(f"  Forward data       → {sum(len(b) for b in real_buffers)} real transitions (pooled)")
+        print(f"  Inverse data       → {sum(len(b) for b in sim_buffers)} sim transitions (pooled)")
+    else:
+        for i in range(n_agents):
+            print(f"  Agent {i} real buffer → {len(real_buffers[i])} transitions (exclusive)")
+            print(f"  Agent {i} sim  buffer → {len(sim_buffers[i])} transitions (exclusive)")
     print(f"  Epochs: {n_epochs} | Batch: {batch_size}")
     print(f"{'='*60}")
+
+    # Per-agent loss tracking (only used when shared=False)
+    per_agent_fm_losses = [[] for _ in range(n_agents)]
+    per_agent_im_losses = [[] for _ in range(n_agents)]
 
     for epoch in range(n_epochs):
         epoch_fm, epoch_im = [], []
@@ -719,19 +568,39 @@ def train_gat_models(
             im_loss = gat.train_inverse_step((
                 np.concatenate(sim_obs), np.concatenate(sim_act), np.concatenate(sim_next)
             ))
-            epoch_fm.append(fm_loss); epoch_im.append(im_loss)
+            epoch_fm.append(fm_loss)
+            epoch_im.append(im_loss)
         else:
+            # KEY: each agent trains ONLY on its own buffer — no data sharing
             for i in range(n_agents):
-                epoch_fm.append(gat.train_forward_step(i, real_buffers[i].sample(batch_size)))
-                epoch_im.append(gat.train_inverse_step(i, sim_buffers[i].sample(batch_size)))
+                fm_loss_i = gat.train_forward_step(i, real_buffers[i].sample(batch_size))
+                im_loss_i = gat.train_inverse_step(i, sim_buffers[i].sample(batch_size))
+                epoch_fm.append(fm_loss_i)
+                epoch_im.append(im_loss_i)
+                per_agent_fm_losses[i].append(fm_loss_i)
+                per_agent_im_losses[i].append(im_loss_i)
 
         history['fm_losses'].append(float(np.mean(epoch_fm)))
         history['im_losses'].append(float(np.mean(epoch_im)))
 
         if (epoch + 1) % max(1, n_epochs // 10) == 0:
-            print(f"  Epoch {epoch+1:>4}/{n_epochs} | "
-                  f"FM loss ({fm_desc}): {history['fm_losses'][-1]:.5f} | "
-                  f"IM loss: {history['im_losses'][-1]:.5f}")
+            if shared:
+                print(f"  Epoch {epoch+1:>4}/{n_epochs} | "
+                      f"FM loss ({fm_desc}): {history['fm_losses'][-1]:.5f} | "
+                      f"IM loss: {history['im_losses'][-1]:.5f}")
+            else:
+                # Show each agent's loss separately so it's clear both are training
+                per_agent_parts = [
+                    f"Agent {i} → FM={per_agent_fm_losses[i][-1]:.5f}  IM={per_agent_im_losses[i][-1]:.5f}"
+                    for i in range(n_agents)
+                ]
+                print(f"  Epoch {epoch+1:>4}/{n_epochs} | " + " || ".join(per_agent_parts))
+
+    # Store per-agent histories for the per-agent variant
+    if not shared:
+        for i in range(n_agents):
+            history[f'fm_losses_agent{i}'] = per_agent_fm_losses[i]
+            history[f'im_losses_agent{i}'] = per_agent_im_losses[i]
 
     print("GAT/SGAT model training complete.\n")
     return history
@@ -742,10 +611,6 @@ def train_gat_models(
 # ---------------------------------------------------------------------------
 
 def _eval_real(env_config, agent, obs_size, seed, device, n_episodes: int = 10):
-    """
-    Run n_episodes in the real (slip) environment with a greedy policy.
-    Returns (mean_coverage, mean_reward) averaged over all episodes.
-    """
     all_coverages, all_rewards = [], []
 
     for _ in range(n_episodes):
@@ -1052,8 +917,7 @@ def train_from_scratch_with_gat(
     return agent
 
 
-def _log_best_coverage(run_dir: str, episode: int, coverage: float, algo: str, variant: str, mode: str, slip_prob: float):
-    """Append a best-coverage record to a persistent JSON log in run_dir."""
+def _log_best_coverage(run_dir, episode, coverage, algo, variant, mode, slip_prob):
     log_path = os.path.join(run_dir, 'best_coverage_log.json')
     record = {
         'timestamp':    datetime.now().isoformat(),
@@ -1064,7 +928,6 @@ def _log_best_coverage(run_dir: str, episode: int, coverage: float, algo: str, v
         'mode':         mode,
         'slip_prob':    slip_prob,
     }
-    # Append to existing records if the file already exists
     records = []
     if os.path.exists(log_path):
         with open(log_path, 'r') as f:
@@ -1236,9 +1099,7 @@ if __name__ == '__main__':
     parser.add_argument('--variant', type=str, default='shared',
                         choices=['shared', 'per_agent'])
     parser.add_argument('--sgat', action='store_true', default=False,
-                        help='Use Stochastic GAT with categorical forward model. '
-                             'predicting one of 4 discrete obs values per cell. '
-                             'Recommended when slip_prob > 0.1.')
+                        help='Use Stochastic GAT with categorical forward model.')
     parser.add_argument('--base_model', type=str, default=None)
     parser.add_argument('--slip_prob', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=22)

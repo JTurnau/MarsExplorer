@@ -307,7 +307,7 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
     eval_episodes = []
     
     # Track best model
-    best_eval_reward = -float('inf')
+    best_eval_coverage = -float('inf')
     
     print(f"Starting training with {n_agents} agents")
     print(f"Observation size: {obs_size}x{obs_size}")
@@ -374,12 +374,12 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
             print(f"  Eval Length: {eval_length:.1f}")
             print(f"{'='*60}\n")
             
-            # Save best model
-            if eval_reward > best_eval_reward:
-                best_eval_reward = eval_reward
+            # Save best model based on coverage
+            if eval_coverage > best_eval_coverage:
+                best_eval_coverage = eval_coverage
                 best_model_path = os.path.join(run_dir, 'best_model.pt')
                 agent.save(best_model_path)
-                print(f"*** NEW BEST MODEL saved with eval reward: {eval_reward:.2f} ***\n")
+                print(f"*** NEW BEST MODEL saved with eval coverage: {eval_coverage:.2%} ***\n")
         
         # Logging
         if (episode + 1) % log_freq == 0:
@@ -395,7 +395,7 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
             print(f"  Epsilon: {agent.epsilon:.3f}")
             print(f"  Avg Loss: {avg_loss:.4f}")
             print(f"  Buffer Size: {len(agent.replay_buffer)}")
-            print(f"  Best Eval Reward: {best_eval_reward:.2f}")
+            print(f"  Best Eval Coverage: {best_eval_coverage:.2%}")
             print("-" * 60)
         
         # Save checkpoint
@@ -413,7 +413,7 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
                 'eval_coverages': eval_coverages,
                 'eval_lengths': eval_lengths,
                 'eval_episodes': eval_episodes,
-                'best_eval_reward': best_eval_reward
+                'best_eval_coverage': best_eval_coverage
             }
             metrics_path = os.path.join(run_dir, 'metrics.npy')
             np.save(metrics_path, metrics)
@@ -425,7 +425,7 @@ def train_idqn(env_config, n_episodes=5000, save_freq=100, log_freq=10,
     print("\nTraining completed!")
     print(f"Final model saved to {final_path}")
     print(f"Best model saved to {os.path.join(run_dir, 'best_model.pt')}")
-    print(f"Best eval reward: {best_eval_reward:.2f}")
+    print(f"Best eval coverage: {best_eval_coverage:.2%}")
     
     return agent, episode_rewards, episode_lengths, coverage_rates
 
@@ -434,7 +434,7 @@ if __name__ == '__main__':
     conf["n_agents"] = 2
     conf["shared_map"] = True
     conf["size"] = [15, 15]
-    conf["obstacles"] = 10
+    conf["obstacles"] = 0
     conf["lidar_range"] = 2
     conf["obstacle_size"] = [1, 3]
     conf["env_mode"] = "sim"
