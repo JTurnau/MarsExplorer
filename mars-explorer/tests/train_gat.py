@@ -711,9 +711,6 @@ def finetune_with_gat(
             # Choose which action to store: intended (policy output) or grounded (executed)
             stored_actions = intended if store_intended_actions else grounded
 
-            print(f"intended: {intended}, grounded: {grounded}, stored_actions: {stored_actions}")
-            test = input("hi")
-
             for i in range(n_agents):
                 agent.store_transition(obs[i], stored_actions[i], rewards[i], next_obs[i], done)
                 ep_reward[i] += rewards[i]
@@ -863,9 +860,6 @@ def train_from_scratch_with_gat(
 
             # Choose which action to store: intended (policy output) or grounded (executed)
             stored_actions = intended if store_intended_actions else grounded
-
-            print(f"intended: {intended}, grounded: {grounded}, stored_actions: {stored_actions}")
-            test = input("hi")
 
             for i in range(n_agents):
                 agent.store_transition(obs[i], stored_actions[i], rewards[i], next_obs[i], done)
