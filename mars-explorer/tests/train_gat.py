@@ -14,7 +14,7 @@ Stochasticity flag:
   --sgat            : Use Stochastic GAT (SGAT). The forward model outputs a
                       categorical distribution over the 4 discrete observation
                       values per cell and samples from it during grounding,
-                      capturing real-world transition stochasticity correctly.
+                      capturing "real" environment transition stochasticity correctly.
 
 Observation encoding (from ExplorerMALocalObs):
   0.00 → category 0 → unexplored
@@ -37,7 +37,7 @@ from datetime import datetime
 
 from mars_explorer.envs.explorer import ExplorerMALocalObs
 from mars_explorer.envs.settings import DEFAULT_CONFIG as conf
-from train_idqn import DQN_CNN, IndependentDQN, ReplayBuffer
+from tests.train_shared_dqn import DQN_CNN, DQN, ReplayBuffer
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +357,7 @@ class PerAgentGAT:
 
 
 class PerAgentSGAT(PerAgentGAT):
-    """Stochastic GAT — each agent has its own categorical forward + inverse model."""
+    """Stochastic GAT - each agent has its own categorical forward + inverse model."""
 
     def __init__(self, obs_size: int, n_actions: int, n_agents: int,
                  lr: float = 1e-3, device: str = 'cuda'):
@@ -464,7 +464,7 @@ def collect_trajectories(
     env_config: dict,
     n_episodes: int,
     obs_size:   int,
-    policy:     IndependentDQN | None = None,
+    policy:     DQN | None = None,
     epsilon:    float = 1.0,
     seed:       int   = 22,
     label:      str   = "env",
@@ -530,7 +530,7 @@ def train_gat_models(
     history  = {'fm_losses': [], 'im_losses': []}
 
     is_sgat = isinstance(gat, (SharedSGAT, PerAgentSGAT))
-    fm_desc = "Categorical NLL (SGAT)" if is_sgat else "MSE (GAT)"
+    fm_desc = "NLL (SGAT)" if is_sgat else "MSE (GAT)"
 
     print(f"\n{'='*60}")
     print(f"Training {'SGAT' if is_sgat else 'GAT'} models "
@@ -571,7 +571,7 @@ def train_gat_models(
             epoch_fm.append(fm_loss)
             epoch_im.append(im_loss)
         else:
-            # KEY: each agent trains ONLY on its own buffer — no data sharing
+            # Each agent trains ONLY on its own buffer - no data sharing
             for i in range(n_agents):
                 fm_loss_i = gat.train_forward_step(i, real_buffers[i].sample(batch_size))
                 im_loss_i = gat.train_inverse_step(i, sim_buffers[i].sample(batch_size))
@@ -658,7 +658,8 @@ def finetune_with_gat(
     device:          str   = 'cuda',
     seed:            int   = 22,
     finetune_epsilon: float = 0.05,
-) -> IndependentDQN:
+    store_intended_actions: bool = False
+) -> DQN:
 
     is_sgat   = isinstance(gat, (SharedSGAT, PerAgentSGAT))
     algo_name = 'SGAT' if is_sgat else 'GAT'
@@ -677,7 +678,7 @@ def finetune_with_gat(
     print(f"  Run dir         : {run_dir}")
     print(f"{'='*60}\n")
 
-    agent = IndependentDQN(obs_size=obs_size, n_actions=4, device=device)
+    agent = DQN(obs_size=obs_size, n_actions=4, device=device)
     agent.load(base_agent_path)
     agent.epsilon       = finetune_epsilon
     agent.epsilon_end   = finetune_epsilon
@@ -707,8 +708,14 @@ def finetune_with_gat(
             next_obs, rewards, terminated, truncated, _ = env.step(grounded)
             done = terminated or truncated
 
+            # Choose which action to store: intended (policy output) or grounded (executed)
+            stored_actions = intended if store_intended_actions else grounded
+
+            print(f"intended: {intended}, grounded: {grounded}, stored_actions: {stored_actions}")
+            test = input("hi")
+
             for i in range(n_agents):
-                agent.store_transition(obs[i], grounded[i], rewards[i], next_obs[i], done)
+                agent.store_transition(obs[i], stored_actions[i], rewards[i], next_obs[i], done)
                 ep_reward[i] += rewards[i]
 
             loss = agent.train_step()
@@ -794,7 +801,8 @@ def train_from_scratch_with_gat(
     batch_size:      int   = 128,
     target_update:   int   = 1000,
     gamma:           float = 0.99,
-) -> IndependentDQN:
+    store_intended_actions: bool = False
+) -> DQN:
 
     is_sgat   = isinstance(gat, (SharedSGAT, PerAgentSGAT))
     algo_name = 'SGAT' if is_sgat else 'GAT'
@@ -815,7 +823,7 @@ def train_from_scratch_with_gat(
     env      = ExplorerMALocalObs(conf=env_config)
     n_agents = env.n_agents
 
-    agent = IndependentDQN(
+    agent = DQN(
         obs_size=obs_size,
         n_actions=4,
         learning_rate=learning_rate,
@@ -853,8 +861,14 @@ def train_from_scratch_with_gat(
             next_obs, rewards, terminated, truncated, _ = env.step(grounded)
             done = terminated or truncated
 
+            # Choose which action to store: intended (policy output) or grounded (executed)
+            stored_actions = intended if store_intended_actions else grounded
+
+            print(f"intended: {intended}, grounded: {grounded}, stored_actions: {stored_actions}")
+            test = input("hi")
+
             for i in range(n_agents):
-                agent.store_transition(obs[i], grounded[i], rewards[i], next_obs[i], done)
+                agent.store_transition(obs[i], stored_actions[i], rewards[i], next_obs[i], done)
                 ep_reward[i] += rewards[i]
 
             loss = agent.train_step()
@@ -965,6 +979,7 @@ def run_gat_pipeline(
     log_freq:              int   = 20,
     eval_freq:             int   = 20,
     finetune_epsilon:      float = 0.05,
+    store_intended_actions: bool = False
 ):
     assert variant in ('shared', 'per_agent'), "variant must be 'shared' or 'per_agent'"
     assert mode in ('scratch', 'finetune'),    "mode must be 'scratch' or 'finetune'"
@@ -984,7 +999,7 @@ def run_gat_pipeline(
 
     if mode == 'finetune':
         print("\n[Step 1] Loading base policy for trajectory collection ...")
-        collection_policy = IndependentDQN(obs_size=obs_size, n_actions=n_actions, device=device)
+        collection_policy = DQN(obs_size=obs_size, n_actions=n_actions, device=device)
         collection_policy.load(base_agent_path)
         collection_epsilon = 0.3
     else:
@@ -1059,6 +1074,7 @@ def run_gat_pipeline(
             device=device,
             seed=seed,
             finetune_epsilon=finetune_epsilon,
+            store_intended_actions=store_intended_actions,
         )
     else:
         agent = train_from_scratch_with_gat(
@@ -1075,6 +1091,7 @@ def run_gat_pipeline(
             checkpoint_dir=run_root,
             device=device,
             seed=seed,
+            store_intended_actions=store_intended_actions,
         )
 
     print("\n" + "=" * 70)
@@ -1115,6 +1132,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_freq', type=int, default=200)
     parser.add_argument('--log_freq', type=int, default=20)
     parser.add_argument('--eval_freq', type=int, default=20)
+    parser.add_argument('--store_intended', action='store_true', default=False,
+                    help='Store intended (pre-grounding) actions in replay buffer.')
 
     args = parser.parse_args()
 
@@ -1169,4 +1188,5 @@ if __name__ == '__main__':
         log_freq=args.log_freq,
         eval_freq=args.eval_freq,
         finetune_epsilon=args.finetune_epsilon,
+        store_intended_actions=args.store_intended,
     )
