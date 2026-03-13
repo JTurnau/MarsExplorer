@@ -505,6 +505,55 @@ def collect_trajectories(
     return buffers
 
 
+def collect_trajectories_by_transitions(
+    env_config: dict,
+    n_transitions: int,
+    obs_size:   int,
+    policy:     DQN | None = None,
+    epsilon:    float = 1.0,
+    seed:       int   = 22,
+    label:      str   = "env",
+) -> list[TransitionBuffer]:
+    """Collect until every agent has contributed at least n_transitions total."""
+    env      = ExplorerMALocalObs(conf=env_config)
+    n_agents = env.n_agents
+    buffers  = [TransitionBuffer() for _ in range(n_agents)]
+    total_collected = 0
+    episode = 0
+
+    print(f"\n[Collect] {label}: target {n_transitions} transitions | "
+          f"mode={env_config.get('env_mode')} | slip={env_config.get('slip_prob', 0.0)}")
+
+    while total_collected < n_transitions:
+        obs, _ = env.reset(seed=seed)
+        done   = False
+        episode += 1
+
+        while not done:
+            if policy is not None and random.random() > epsilon:
+                actions = [policy.select_action(obs[i], eval_mode=True) for i in range(n_agents)]
+            else:
+                actions = [random.randrange(4) for _ in range(n_agents)]
+
+            next_obs, _, terminated, truncated, _ = env.step(actions)
+            done = terminated or truncated
+
+            for i in range(n_agents):
+                buffers[i].push(
+                    obs[i].flatten().astype(np.float32),
+                    actions[i],
+                    next_obs[i].flatten().astype(np.float32),
+                )
+            total_collected += n_agents
+            obs = next_obs
+
+        if episode % 10 == 0 or total_collected >= n_transitions:
+            print(f"  Episode {episode} | transitions collected={total_collected}/{n_transitions}")
+
+    env.close()
+    return buffers
+
+
 # ---------------------------------------------------------------------------
 # GAT / SGAT Model Training
 # ---------------------------------------------------------------------------
@@ -961,6 +1010,8 @@ def run_gat_pipeline(
     n_actions:             int   = 4,
     collect_episodes_real: int   = 200,
     collect_episodes_sim:  int   = 200,
+    collect_transitions_real: int | None = None,
+    collect_transitions_sim:  int | None = None,
     gat_epochs:            int   = 100,
     gat_batch_size:        int   = 256,
     gat_lr:                float = 1e-3,
@@ -1002,27 +1053,49 @@ def run_gat_pipeline(
         collection_epsilon = 1.0
 
     print("\n[Step 2] Collecting real-world trajectories ...")
-    real_buffers = collect_trajectories(
-        env_config=env_config_real,
-        n_episodes=collect_episodes_real,
-        obs_size=obs_size,
-        policy=collection_policy,
-        epsilon=collection_epsilon,
-        seed=seed,
-        label="REAL",
-    )
+    if collect_transitions_real is not None:
+        real_buffers = collect_trajectories_by_transitions(
+            env_config=env_config_real,
+            n_transitions=collect_transitions_real,
+            obs_size=obs_size,
+            policy=collection_policy,
+            epsilon=collection_epsilon,
+            seed=seed,
+            label="REAL",
+        )
+    else:
+        real_buffers = collect_trajectories(
+            env_config=env_config_real,
+            n_episodes=collect_episodes_real,
+            obs_size=obs_size,
+            policy=collection_policy,
+            epsilon=collection_epsilon,
+            seed=seed,
+            label="REAL",
+        )
     print(f"  Real buffer sizes: {[len(b) for b in real_buffers]}")
 
     print("\n[Step 3] Collecting simulation trajectories ...")
-    sim_buffers = collect_trajectories(
-        env_config=env_config_sim,
-        n_episodes=collect_episodes_sim,
-        obs_size=obs_size,
-        policy=collection_policy,
-        epsilon=collection_epsilon,
-        seed=seed,
-        label="SIM",
-    )
+    if collect_transitions_sim is not None:
+        sim_buffers = collect_trajectories_by_transitions(
+            env_config=env_config_sim,
+            n_transitions=collect_transitions_sim,
+            obs_size=obs_size,
+            policy=collection_policy,
+            epsilon=collection_epsilon,
+            seed=seed,
+            label="SIM",
+        )
+    else:
+        sim_buffers = collect_trajectories(
+            env_config=env_config_sim,
+            n_episodes=collect_episodes_sim,
+            obs_size=obs_size,
+            policy=collection_policy,
+            epsilon=collection_epsilon,
+            seed=seed,
+            label="SIM",
+        )
     print(f"  Sim buffer sizes: {[len(b) for b in sim_buffers]}")
 
     print(f"\n[Step 4] Building and training {algo_name} models ...")
@@ -1116,6 +1189,12 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=22)
     parser.add_argument('--collect_real', type=int, default=200)
     parser.add_argument('--collect_sim', type=int, default=200)
+    parser.add_argument('--collect_real_transitions', type=int, default=None,
+                        help='Collect exactly this many transitions from the real env '
+                             '(overrides --collect_real episode count).')
+    parser.add_argument('--collect_sim_transitions', type=int, default=None,
+                        help='Collect exactly this many transitions from the sim env '
+                             '(overrides --collect_sim episode count).')
     parser.add_argument('--gat_epochs', type=int, default=100)
     parser.add_argument('--gat_lr', type=float, default=1e-3)
     parser.add_argument('--train_episodes', type=int, default=2000)
@@ -1171,6 +1250,8 @@ if __name__ == '__main__':
         n_actions=4,
         collect_episodes_real=args.collect_real,
         collect_episodes_sim=args.collect_sim,
+        collect_transitions_real=args.collect_real_transitions,
+        collect_transitions_sim=args.collect_sim_transitions,
         gat_epochs=args.gat_epochs,
         gat_lr=args.gat_lr,
         train_episodes=args.train_episodes,
